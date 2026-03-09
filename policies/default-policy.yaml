@@ -1,0 +1,14 @@
+version: 1
+
+# Required fields for deployment readiness evaluation.
+# A model BOM must have all of these to pass the "evaluate" check.
+required_fields:
+  - hash
+  - license
+  - model_card
+  - evidence
+  - trust_labels
+
+# Daemon settings.
+daemon:
+  bind_addr: "127.0.0.1:8515"
