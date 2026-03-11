@@ -18,12 +18,19 @@ import (
 
 // ModelBOM is the top-level CycloneDX ML-BOM document.
 type ModelBOM struct {
-	BOMFormat    string       `json:"bomFormat" yaml:"bomFormat"`
-	SpecVersion  string       `json:"specVersion" yaml:"specVersion"`
-	Version      int          `json:"version" yaml:"version"`
-	SerialNumber string       `json:"serialNumber" yaml:"serialNumber"`
-	Metadata     BOMMetadata  `json:"metadata" yaml:"metadata"`
-	Components   []Component  `json:"components" yaml:"components"`
+	BOMFormat      string         `json:"bomFormat" yaml:"bomFormat"`
+	SpecVersion    string         `json:"specVersion" yaml:"specVersion"`
+	Version        int            `json:"version" yaml:"version"`
+	SerialNumber   string         `json:"serialNumber" yaml:"serialNumber"`
+	Metadata       BOMMetadata    `json:"metadata" yaml:"metadata"`
+	Components     []Component    `json:"components" yaml:"components"`
+	Dependencies   []Dependency   `json:"dependencies,omitempty" yaml:"dependencies,omitempty"`
+}
+
+// Dependency records a CycloneDX dependency relationship.
+type Dependency struct {
+	Ref       string   `json:"ref" yaml:"ref"`
+	DependsOn []string `json:"dependsOn,omitempty" yaml:"dependsOn,omitempty"`
 }
 
 // BOMMetadata describes when and how the BOM was generated.
@@ -120,13 +127,21 @@ type Adapter struct {
 
 // ---------- BOM generation ----------
 
-const bomToolVersion = "0.1.0"
+const bomToolVersion = "0.2.0"
+
+// MaxFileSize is the maximum model file size to hash (10 GiB).
+const MaxFileSize = 10 << 30
 
 // GenerateBOM creates a BOM from a model directory or single file.
 func GenerateBOM(path string, meta *ModelMetadata) (*ModelBOM, error) {
-	info, err := os.Stat(path)
+	info, err := os.Lstat(path) // Lstat to detect symlinks
 	if err != nil {
 		return nil, fmt.Errorf("stat %s: %w", path, err)
+	}
+
+	// Reject symlinks, devices, FIFOs at the top level
+	if !info.Mode().IsDir() && !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("refusing to scan non-regular file: %s (mode=%s)", path, info.Mode())
 	}
 
 	bom := &ModelBOM{
@@ -158,6 +173,14 @@ func GenerateBOM(path string, meta *ModelMetadata) (*ModelBOM, error) {
 		bom.Components = []Component{comp}
 	}
 
+	// Wire lineage into generation when metadata has quantization/adapter info
+	if meta != nil {
+		wireLineage(bom, meta)
+	}
+
+	// Build dependency graph for multi-component BOMs
+	bom.Dependencies = buildDependencies(bom.Components)
+
 	// Set primary component
 	if len(bom.Components) > 0 {
 		primary := bom.Components[0]
@@ -167,12 +190,119 @@ func GenerateBOM(path string, meta *ModelMetadata) (*ModelBOM, error) {
 	return bom, nil
 }
 
+// wireLineage automatically embeds lineage properties when metadata provides lineage info.
+func wireLineage(bom *ModelBOM, meta *ModelMetadata) {
+	for i, comp := range bom.Components {
+		if comp.Type != "machine-learning-model" {
+			continue
+		}
+
+		card := comp.ModelCard
+		if card == nil {
+			continue
+		}
+
+		outputHash := ""
+		if len(comp.Hashes) > 0 {
+			outputHash = comp.Hashes[0].Content
+		}
+
+		var chain *LineageChain
+
+		// Build quantization lineage
+		if card.Quantization != nil && card.Quantization.Method != "" && meta.BaseModel != "" {
+			baseHash := meta.BaseModelHash
+			chain = BuildQuantizationLineage(
+				meta.BaseModel, baseHash,
+				card.Quantization.Method, outputHash,
+				meta.QuantizedBy,
+			)
+		}
+
+		// Build adapter lineage
+		if len(card.Adapters) > 0 && meta.BaseModel != "" {
+			baseHash := meta.BaseModelHash
+			chain = BuildAdapterLineage(meta.BaseModel, baseHash, card.Adapters, outputHash)
+		}
+
+		// Add promotion step
+		if chain != nil && meta.PromotionStatus != "" {
+			chain.AddPromotion(meta.PromotionStatus, "", meta.PromotionReason)
+		}
+
+		// If no chain built but we have a base model, create a simple one
+		if chain == nil && meta.BaseModel != "" {
+			chain = NewLineageChain(comp.Name, outputHash)
+			chain.AddEntry("download", fmt.Sprintf("base model: %s", meta.BaseModel),
+				"", meta.BaseModelHash, "", "", nil)
+			if meta.PromotionStatus != "" {
+				chain.AddPromotion(meta.PromotionStatus, "", meta.PromotionReason)
+			}
+		}
+
+		// Embed lineage as properties
+		if chain != nil {
+			bom.Components[i].Properties = append(bom.Components[i].Properties, chain.ToProperties()...)
+		}
+	}
+}
+
+// buildDependencies creates CycloneDX dependency relationships.
+func buildDependencies(components []Component) []Dependency {
+	if len(components) < 2 {
+		return nil
+	}
+
+	var deps []Dependency
+	var modelRef string
+
+	for _, comp := range components {
+		if comp.Type == "machine-learning-model" && modelRef == "" {
+			modelRef = comp.BOMRef
+		}
+	}
+
+	if modelRef == "" {
+		return nil
+	}
+
+	// Tokenizers and adapters depend on the primary model
+	var dependsOn []string
+	for _, comp := range components {
+		if comp.BOMRef == modelRef {
+			continue
+		}
+		for _, prop := range comp.Properties {
+			if prop.Name == "secai:component_type" && (prop.Value == "tokenizer" || prop.Value == "adapter") {
+				dependsOn = append(dependsOn, comp.BOMRef)
+			}
+		}
+	}
+
+	if len(dependsOn) > 0 {
+		deps = append(deps, Dependency{Ref: modelRef, DependsOn: dependsOn})
+	}
+
+	return deps
+}
+
 // scanDirectory walks a directory and creates components for model files.
+// Rejects symlinks, devices, FIFOs, and files exceeding MaxFileSize.
 func scanDirectory(dir string, meta *ModelMetadata) ([]Component, error) {
 	var components []Component
 
 	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
+			return nil
+		}
+
+		// Reject non-regular files (symlinks, devices, FIFOs, sockets)
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+
+		// Enforce max file size
+		if info.Size() > MaxFileSize {
 			return nil
 		}
 
@@ -185,7 +315,6 @@ func scanDirectory(dir string, meta *ModelMetadata) ([]Component, error) {
 			}
 			components = append(components, comp)
 		case ".json":
-			// Tokenizer config, adapter config
 			if isTokenizerFile(info.Name()) {
 				comp := buildTokenizerComponent(path, info)
 				components = append(components, comp)
@@ -266,11 +395,13 @@ type ModelMetadata struct {
 	Version         string   `yaml:"version,omitempty"`
 	Description     string   `yaml:"description,omitempty"`
 	BaseModel       string   `yaml:"base_model,omitempty"`
+	BaseModelHash   string   `yaml:"base_model_hash,omitempty"`
 	ModelFamily     string   `yaml:"model_family,omitempty"`
 	License         string   `yaml:"license,omitempty"`
 	SourceURL       string   `yaml:"source_url,omitempty"`
 	TrustLabels     []string `yaml:"trust_labels,omitempty"`
 	PromotionStatus string   `yaml:"promotion_status,omitempty"`
+	PromotionReason string   `yaml:"promotion_reason,omitempty"`
 	QuantizedBy     string   `yaml:"quantized_by,omitempty"`
 	QuantizedAt     string   `yaml:"quantized_at,omitempty"`
 }

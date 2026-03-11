@@ -123,6 +123,19 @@ func TestGenerateBOM_SerialNumber(t *testing.T) {
 	}
 }
 
+func TestGenerateBOM_RejectsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "real.gguf")
+	os.WriteFile(target, []byte("data"), 0o644)
+	link := filepath.Join(dir, "link.gguf")
+	os.Symlink(target, link)
+
+	_, err := GenerateBOM(link, nil)
+	if err == nil {
+		t.Error("expected error for symlink, got nil")
+	}
+}
+
 // ---------- filename parsing tests ----------
 
 func TestParseFilename_GGUF(t *testing.T) {
@@ -225,6 +238,34 @@ func TestLineage_VerifyBroken(t *testing.T) {
 	}
 	if failIdx != 1 {
 		t.Errorf("expected failure at step 1, got %d", failIdx)
+	}
+}
+
+func TestLineage_WiredIntoGenerate(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "model.Q4_K_M.gguf"), []byte("data"), 0o644)
+
+	meta := &ModelMetadata{
+		BaseModel:     "llama-2-7b",
+		BaseModelHash: "abc123",
+	}
+
+	bom, err := GenerateBOM(dir, meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Should have lineage properties wired in
+	comp := bom.Components[0]
+	hasLineage := false
+	for _, p := range comp.Properties {
+		if strings.HasPrefix(p.Name, "secai:lineage:") {
+			hasLineage = true
+			break
+		}
+	}
+	if !hasLineage {
+		t.Error("expected lineage properties wired into component")
 	}
 }
 
@@ -490,6 +531,207 @@ func TestDiff_PromotionChange(t *testing.T) {
 	}
 }
 
+// ---------- validation tests ----------
+
+func TestValidateMetadata_ValidURL(t *testing.T) {
+	meta := &ModelMetadata{SourceURL: "https://example.com/model"}
+	issues := ValidateMetadata(meta)
+	for _, iss := range issues {
+		if iss.Field == "source_url" {
+			t.Errorf("valid URL should not produce issue: %s", iss.Message)
+		}
+	}
+}
+
+func TestValidateMetadata_InvalidURL(t *testing.T) {
+	meta := &ModelMetadata{SourceURL: "not-a-url"}
+	issues := ValidateMetadata(meta)
+	found := false
+	for _, iss := range issues {
+		if iss.Field == "source_url" && iss.Severity == "error" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("invalid URL should produce error")
+	}
+}
+
+func TestValidateMetadata_InvalidPromotion(t *testing.T) {
+	meta := &ModelMetadata{PromotionStatus: "maybe"}
+	issues := ValidateMetadata(meta)
+	found := false
+	for _, iss := range issues {
+		if iss.Field == "promotion_status" && iss.Severity == "error" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("invalid promotion status should produce error")
+	}
+}
+
+func TestValidateMetadata_DuplicateTrustLabels(t *testing.T) {
+	meta := &ModelMetadata{TrustLabels: []string{"scanned", "scanned", "verified"}}
+	issues := ValidateMetadata(meta)
+	found := false
+	for _, iss := range issues {
+		if iss.Field == "trust_labels" && iss.Severity == "warning" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("duplicate trust labels should produce warning")
+	}
+	if len(meta.TrustLabels) != 2 {
+		t.Errorf("expected deduplication to 2, got %d", len(meta.TrustLabels))
+	}
+}
+
+func TestValidateBOM_Valid(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "m.gguf"), []byte("x"), 0o644)
+	bom, _ := GenerateBOM(dir, nil)
+
+	issues := ValidateBOM(bom)
+	for _, iss := range issues {
+		if iss.Severity == "error" {
+			t.Errorf("valid BOM should not have errors: %s: %s", iss.Field, iss.Message)
+		}
+	}
+}
+
+func TestValidateBOM_DuplicateBOMRef(t *testing.T) {
+	bom := &ModelBOM{
+		BOMFormat:    "CycloneDX",
+		SerialNumber: "urn:uuid:test",
+		Components: []Component{
+			{Name: "a", BOMRef: "same-ref"},
+			{Name: "b", BOMRef: "same-ref"},
+		},
+	}
+	issues := ValidateBOM(bom)
+	found := false
+	for _, iss := range issues {
+		if iss.Field == "bom-ref" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("duplicate bom-ref should produce error")
+	}
+}
+
+// ---------- redaction tests ----------
+
+func TestRedactEvidence_Emails(t *testing.T) {
+	items := []EvidenceItem{
+		{Description: "scanned by user@example.com", Result: "pass"},
+	}
+	profile := PrivacyProfile{StripEmails: true}
+	redacted := RedactEvidence(items, profile)
+
+	if strings.Contains(redacted[0].Description, "user@example.com") {
+		t.Error("email should be redacted")
+	}
+	if !strings.Contains(redacted[0].Description, "[REDACTED:email]") {
+		t.Error("expected [REDACTED:email] placeholder")
+	}
+}
+
+func TestRedactEvidence_Paths(t *testing.T) {
+	items := []EvidenceItem{
+		{Description: "model at /home/user/models/test.gguf"},
+	}
+	profile := PrivacyProfile{StripPaths: true}
+	redacted := RedactEvidence(items, profile)
+
+	if strings.Contains(redacted[0].Description, "/home/user") {
+		t.Error("path should be redacted")
+	}
+}
+
+func TestRedactEvidence_Hostnames(t *testing.T) {
+	items := []EvidenceItem{
+		{Description: "fetched from build01.internal"},
+	}
+	profile := PrivacyProfile{StripHostnames: true}
+	redacted := RedactEvidence(items, profile)
+
+	if strings.Contains(redacted[0].Description, "build01.internal") {
+		t.Error("hostname should be redacted")
+	}
+}
+
+func TestRedactBOM_FullProfile(t *testing.T) {
+	bom := &ModelBOM{
+		Components: []Component{{
+			Name: "model.gguf",
+			Evidence: []EvidenceItem{
+				{
+					Description: "scanned by admin@corp.local on build01.internal",
+					Details: map[string]string{
+						"reviewer": "jane_doe",
+						"path":     "/home/user/models/test.gguf",
+					},
+				},
+			},
+		}},
+	}
+
+	profile := DefaultPrivacyProfile()
+	redacted := RedactBOM(bom, profile)
+
+	ev := redacted.Components[0].Evidence[0]
+	if strings.Contains(ev.Description, "admin@corp.local") {
+		t.Error("email in description should be redacted")
+	}
+	if ev.Details["reviewer"] != "[REDACTED]" {
+		t.Error("sensitive key 'reviewer' should be fully redacted")
+	}
+}
+
+// ---------- path allowlist tests ----------
+
+func TestIsPathAllowed_EmptyAllowlist(t *testing.T) {
+	if !isPathAllowed("/any/path", nil) {
+		t.Error("empty allowlist should permit all")
+	}
+}
+
+func TestIsPathAllowed_MatchingPath(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "models")
+	os.MkdirAll(sub, 0o755)
+
+	if !isPathAllowed(sub, []string{dir}) {
+		t.Error("subpath of allowed dir should be permitted")
+	}
+}
+
+func TestIsPathAllowed_NotMatching(t *testing.T) {
+	dir := t.TempDir()
+	if isPathAllowed("/etc/passwd", []string{dir}) {
+		t.Error("path outside allowlist should be denied")
+	}
+}
+
+// ---------- privacy profile resolution ----------
+
+func TestResolvePrivacyProfile_None(t *testing.T) {
+	p := resolvePrivacyProfile("none")
+	if p.StripEmails || p.StripPaths || p.StripHostnames || p.StripUsernames {
+		t.Error("'none' profile should strip nothing")
+	}
+}
+
+func TestResolvePrivacyProfile_Default(t *testing.T) {
+	p := resolvePrivacyProfile("default")
+	if !p.StripEmails || !p.StripPaths || !p.StripHostnames || !p.StripUsernames {
+		t.Error("'default' profile should strip all categories")
+	}
+}
+
 // ---------- HTTP handler tests ----------
 
 func buildTestMux(t *testing.T) *http.ServeMux {
@@ -499,72 +741,9 @@ func buildTestMux(t *testing.T) *http.ServeMux {
 
 func buildTestMuxWithToken(t *testing.T, token string) *http.ServeMux {
 	t.Helper()
-
 	_, priv, _ := ed25519.GenerateKey(rand.Reader)
-
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	})
-
-	mux.HandleFunc("/v1/diff", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		var req struct {
-			Old *ModelBOM `json:"old"`
-			New *ModelBOM `json:"new"`
-		}
-		json.NewDecoder(r.Body).Decode(&req)
-		if req.Old == nil || req.New == nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(DiffBOMs(req.Old, req.New))
-	})
-
-	mux.HandleFunc("/v1/evaluate", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		var bom ModelBOM
-		json.NewDecoder(r.Body).Decode(&bom)
-		ready, missing := EvaluateReadiness(&bom, []string{"hash"})
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{"ready": ready, "missing": missing})
-	})
-
-	mux.HandleFunc("/v1/attest", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		if !checkToken(r, token) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		var req struct {
-			Subject   string `json:"subject"`
-			Predicate string `json:"predicate"`
-		}
-		json.NewDecoder(r.Body).Decode(&req)
-		att := CreateAttestation(req.Subject, req.Predicate, "test", nil)
-		SignAttestation(&att, priv)
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(att)
-	})
-
-	mux.HandleFunc("/v1/metrics", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]int64{"generated_total": metricGenerated.Load()})
-	})
-
-	return mux
+	cfg := &ServiceConfig{Version: 1}
+	return buildMux(cfg, priv, token)
 }
 
 func TestHTTP_Health(t *testing.T) {
@@ -573,6 +752,15 @@ func TestHTTP_Health(t *testing.T) {
 	mux.ServeHTTP(w, httptest.NewRequest("GET", "/health", nil))
 	if w.Code != 200 {
 		t.Errorf("expected 200, got %d", w.Code)
+	}
+}
+
+func TestHTTP_HealthNoAuth(t *testing.T) {
+	mux := buildTestMuxWithToken(t, "secret")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest("GET", "/health", nil))
+	if w.Code != 200 {
+		t.Errorf("health should not require auth, got %d", w.Code)
 	}
 }
 
@@ -588,7 +776,8 @@ func TestHTTP_Diff(t *testing.T) {
 
 func TestHTTP_Evaluate(t *testing.T) {
 	mux := buildTestMux(t)
-	body := `{"components":[{"type":"machine-learning-model","name":"m","hashes":[{"alg":"SHA-256","content":"abc"}]}]}`
+	// Must satisfy default required_fields: hash, license, model_card
+	body := `{"components":[{"type":"machine-learning-model","name":"m","hashes":[{"alg":"SHA-256","content":"abc"}],"licenses":[{"name":"MIT"}],"modelCard":{}}]}`
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, httptest.NewRequest("POST", "/v1/evaluate", strings.NewReader(body)))
 	if w.Code != 200 {
@@ -597,7 +786,7 @@ func TestHTTP_Evaluate(t *testing.T) {
 	var resp map[string]interface{}
 	json.NewDecoder(w.Body).Decode(&resp)
 	if resp["ready"] != true {
-		t.Error("should be ready with hash present")
+		t.Error("should be ready with hash, license, and model_card present")
 	}
 }
 
@@ -616,6 +805,51 @@ func TestHTTP_AttestRequiresToken(t *testing.T) {
 	mux.ServeHTTP(w, req)
 	if w.Code != 200 {
 		t.Errorf("expected 200 with valid token, got %d", w.Code)
+	}
+}
+
+func TestHTTP_AllEndpointsRequireAuth(t *testing.T) {
+	mux := buildTestMuxWithToken(t, "tok")
+
+	endpoints := []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{"POST", "/v1/generate", `{"path":"/tmp"}`},
+		{"POST", "/v1/verify", `{}`},
+		{"POST", "/v1/diff", `{"old":{},"new":{}}`},
+		{"POST", "/v1/evaluate", `{}`},
+		{"POST", "/v1/attest", `{"subject":"m"}`},
+		{"GET", "/v1/metrics", ""},
+	}
+
+	for _, ep := range endpoints {
+		var body *strings.Reader
+		if ep.body != "" {
+			body = strings.NewReader(ep.body)
+		} else {
+			body = strings.NewReader("")
+		}
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(ep.method, ep.path, body))
+		if w.Code != 401 {
+			t.Errorf("%s %s: expected 401 without token, got %d", ep.method, ep.path, w.Code)
+		}
+	}
+}
+
+func TestHTTP_GeneratePathAllowlist(t *testing.T) {
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	cfg := &ServiceConfig{Version: 1}
+	cfg.Daemon.AllowedPaths = []string{"/only/this/dir"}
+	mux := buildMux(cfg, priv, "")
+
+	body := `{"path":"/etc/passwd"}`
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest("POST", "/v1/generate", strings.NewReader(body)))
+	if w.Code != 403 {
+		t.Errorf("expected 403 for disallowed path, got %d", w.Code)
 	}
 }
 
@@ -653,6 +887,34 @@ func TestCheckToken_Invalid(t *testing.T) {
 	}
 }
 
+// ---------- dependency graph tests ----------
+
+func TestBuildDependencies_ModelWithTokenizer(t *testing.T) {
+	components := []Component{
+		{Type: "machine-learning-model", BOMRef: "model.gguf", Name: "model.gguf"},
+		{Type: "data", BOMRef: "tokenizer:tokenizer.json", Name: "tokenizer.json",
+			Properties: []Property{{Name: "secai:component_type", Value: "tokenizer"}}},
+	}
+
+	deps := buildDependencies(components)
+	if len(deps) != 1 {
+		t.Fatalf("expected 1 dependency, got %d", len(deps))
+	}
+	if deps[0].Ref != "model.gguf" {
+		t.Errorf("expected model ref, got %s", deps[0].Ref)
+	}
+	if len(deps[0].DependsOn) != 1 || deps[0].DependsOn[0] != "tokenizer:tokenizer.json" {
+		t.Error("expected tokenizer in dependsOn")
+	}
+}
+
+func TestBuildDependencies_SingleComponent(t *testing.T) {
+	deps := buildDependencies([]Component{{Name: "m.gguf"}})
+	if deps != nil {
+		t.Error("single component should have no dependencies")
+	}
+}
+
 // ---------- integration test ----------
 
 func TestIntegration_FullWorkflow(t *testing.T) {
@@ -674,20 +936,28 @@ func TestIntegration_FullWorkflow(t *testing.T) {
 		t.Fatal("no components generated")
 	}
 
-	// 2. Attach evidence
+	// 2. Validate BOM
+	issues := ValidateBOM(bom)
+	for _, iss := range issues {
+		if iss.Severity == "error" {
+			t.Errorf("generated BOM has validation error: %s: %s", iss.Field, iss.Message)
+		}
+	}
+
+	// 3. Attach evidence
 	evidence := []EvidenceItem{
-		{Type: "scan", Source: "ai-quarantine", Result: "pass", Description: "clean"},
-		{Type: "test", Source: "gguf-guard", Result: "pass", Description: "valid GGUF"},
+		{Type: "scan", Source: "ai-quarantine", Result: "pass", Description: "clean", Timestamp: "2025-01-01T00:00:00Z"},
+		{Type: "test", Source: "gguf-guard", Result: "pass", Description: "valid GGUF", Timestamp: "2025-01-01T00:00:00Z"},
 	}
 	AttachEvidence(bom, bom.Components[0].Name, evidence)
 
-	// 3. Evaluate readiness
+	// 4. Evaluate readiness
 	ready, _ := EvaluateReadiness(bom, []string{"hash", "license", "evidence", "trust_labels"})
 	if !ready {
 		t.Error("should be ready after attaching evidence")
 	}
 
-	// 4. Sign BOM
+	// 5. Sign BOM
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	sb := SignBOM(bom, priv, "test")
 	valid, reason := VerifySignedBOM(sb, pub)
@@ -695,14 +965,14 @@ func TestIntegration_FullWorkflow(t *testing.T) {
 		t.Errorf("signed BOM should verify: %s", reason)
 	}
 
-	// 5. Create attestation
+	// 6. Create attestation
 	att := CreateAttestation(bom.Components[0].Name, "deployment-ready", "ci", evidence)
 	SignAttestation(&att, priv)
 	if !VerifyAttestation(att, pub) {
 		t.Error("attestation should verify")
 	}
 
-	// 6. Build lineage
+	// 7. Build lineage
 	h := sha256.Sum256([]byte("model-weights"))
 	modelHash := hex.EncodeToString(h[:])
 	chain := BuildQuantizationLineage("llama-2-7b", "base-hash", "Q5_K_S", modelHash, "operator")
@@ -712,7 +982,7 @@ func TestIntegration_FullWorkflow(t *testing.T) {
 		t.Error("lineage chain should be valid")
 	}
 
-	// 7. Diff with modified version
+	// 8. Diff with modified version
 	bom2, _ := GenerateBOM(dir, &ModelMetadata{
 		BaseModel:       "llama-3-8b", // changed!
 		License:         "Apache-2.0",
@@ -721,5 +991,11 @@ func TestIntegration_FullWorkflow(t *testing.T) {
 	diff := DiffBOMs(bom, bom2)
 	if !diff.TrustRelevant {
 		t.Error("base model change should be trust-relevant")
+	}
+
+	// 9. Redact evidence
+	redacted := RedactBOM(bom, DefaultPrivacyProfile())
+	if redacted == nil {
+		t.Error("redacted BOM should not be nil")
 	}
 }

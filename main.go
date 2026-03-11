@@ -6,13 +6,16 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -20,10 +23,10 @@ import (
 // ---------- metrics ----------
 
 var (
-	metricGenerated  atomic.Int64
-	metricVerified   atomic.Int64
-	metricDiffs      atomic.Int64
-	metricHTTPReqs   atomic.Int64
+	metricGenerated atomic.Int64
+	metricVerified  atomic.Int64
+	metricDiffs     atomic.Int64
+	metricHTTPReqs  atomic.Int64
 )
 
 // ---------- config ----------
@@ -33,8 +36,12 @@ type ServiceConfig struct {
 	Version        int      `yaml:"version"`
 	RequiredFields []string `yaml:"required_fields"`
 	Daemon         struct {
-		BindAddr string `yaml:"bind_addr"`
+		BindAddr     string   `yaml:"bind_addr"`
+		AllowedPaths []string `yaml:"allowed_paths"`
+		ReadTimeout  int      `yaml:"read_timeout_seconds"`
+		WriteTimeout int      `yaml:"write_timeout_seconds"`
 	} `yaml:"daemon"`
+	PrivacyProfile *PrivacyProfile `yaml:"privacy_profile,omitempty"`
 }
 
 // ---------- main ----------
@@ -47,21 +54,23 @@ func main() {
 
 	switch os.Args[1] {
 	case "generate":
-		cmdGenerate()
+		cmdGenerate(os.Args[2:])
 	case "verify":
-		cmdVerify()
+		cmdVerify(os.Args[2:])
 	case "diff":
-		cmdDiff()
+		cmdDiff(os.Args[2:])
 	case "attest":
-		cmdAttest()
+		cmdAttest(os.Args[2:])
 	case "evaluate":
-		cmdEvaluate()
+		cmdEvaluate(os.Args[2:])
 	case "serve":
-		cmdServe()
+		cmdServe(os.Args[2:])
 	case "keygen":
-		cmdKeygen()
+		cmdKeygen(os.Args[2:])
+	case "help", "--help", "-h":
+		usage()
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
+		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n", os.Args[1])
 		usage()
 		os.Exit(1)
 	}
@@ -71,18 +80,24 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `ai-model-bom — AI/ML BOM generator, verifier, and attestation companion
 
 Usage:
-  ai-model-bom generate   PATH [-meta FILE] [-out FILE]    Generate BOM from model
-  ai-model-bom verify     FILE                              Verify signed BOM
-  ai-model-bom diff       OLD NEW                           Compare two BOMs
-  ai-model-bom attest     BOM [-subject S] [-predicate P]   Create signed attestation
-  ai-model-bom evaluate   BOM                               Check deployment readiness
-  ai-model-bom serve      [-config FILE]                    Run as HTTP daemon
-  ai-model-bom keygen     [-out PREFIX]                     Generate Ed25519 keypair
+  ai-model-bom <command> [flags]
+
+Commands:
+  generate   Generate BOM from a model file or directory
+  verify     Verify a signed BOM
+  diff       Compare two BOMs
+  attest     Create a signed attestation
+  evaluate   Check deployment readiness
+  serve      Run as HTTP daemon
+  keygen     Generate Ed25519 keypair
+
+Run "ai-model-bom <command> --help" for command-specific flags.
 
 Environment:
-  AIMBOM_CONFIG     Path to config YAML (default: policies/default-policy.yaml)
-  SERVICE_TOKEN     Bearer token for protected endpoints
-  SIGNING_KEY       Base64-encoded Ed25519 private key
+  AIMBOM_CONFIG   Path to config YAML (default: policies/default-policy.yaml)
+  SERVICE_TOKEN   Bearer token for protected endpoints
+  SIGNING_KEY     Base64-encoded Ed25519 private key
+  VERIFY_KEY      Base64-encoded Ed25519 public key (for verify command)
 `)
 }
 
@@ -105,15 +120,12 @@ func loadSigningKey() ed25519.PrivateKey {
 	return ed25519.PrivateKey(data)
 }
 
-func loadConfig() *ServiceConfig {
-	path := envOr("AIMBOM_CONFIG", "policies/default-policy.yaml")
-	for i, arg := range os.Args[2:] {
-		if arg == "-config" && i+1 < len(os.Args[2:])-1 {
-			path = os.Args[i+3]
-		}
+func loadConfig(configPath string) *ServiceConfig {
+	if configPath == "" {
+		configPath = envOr("AIMBOM_CONFIG", "policies/default-policy.yaml")
 	}
 
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return &ServiceConfig{Version: 1}
 	}
@@ -125,30 +137,50 @@ func loadConfig() *ServiceConfig {
 
 // ---------- CLI commands ----------
 
-func cmdGenerate() {
-	if len(os.Args) < 3 {
-		log.Fatal("usage: ai-model-bom generate PATH [-meta FILE] [-out FILE]")
+func cmdGenerate(args []string) {
+	fs := flag.NewFlagSet("generate", flag.ExitOnError)
+	metaFile := fs.String("meta", "", "Path to metadata YAML file")
+	outFile := fs.String("out", "", "Output file path (default: stdout)")
+	evidenceFile := fs.String("evidence", "", "Path to evidence JSON file to attach")
+	evidenceComp := fs.String("evidence-component", "", "Component bom-ref or name to attach evidence to")
+	privacyFlag := fs.String("privacy-profile", "", "Privacy profile: none, default, or path to YAML")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: ai-model-bom generate PATH [flags]\n\nFlags:\n")
+		fs.PrintDefaults()
+	}
+	fs.Parse(args)
+
+	if fs.NArg() < 1 {
+		fs.Usage()
+		os.Exit(1)
 	}
 
-	modelPath := os.Args[2]
-	var meta *ModelMetadata
-	outFile := ""
+	modelPath := fs.Arg(0)
 
-	for i, arg := range os.Args[3:] {
-		switch arg {
-		case "-meta":
-			if i+1 < len(os.Args[3:])-1 {
-				metaPath := os.Args[i+4]
-				data, err := os.ReadFile(metaPath)
-				if err != nil {
-					log.Fatalf("read metadata: %v", err)
-				}
-				meta = &ModelMetadata{}
-				yaml.Unmarshal(data, meta)
+	// Load metadata if provided
+	var meta *ModelMetadata
+	if *metaFile != "" {
+		data, err := os.ReadFile(*metaFile)
+		if err != nil {
+			log.Fatalf("read metadata: %v", err)
+		}
+		meta = &ModelMetadata{}
+		if err := yaml.Unmarshal(data, meta); err != nil {
+			log.Fatalf("parse metadata: %v", err)
+		}
+		// Validate metadata
+		if issues := ValidateMetadata(meta); len(issues) > 0 {
+			for _, iss := range issues {
+				log.Printf("metadata %s: %s: %s", iss.Severity, iss.Field, iss.Message)
 			}
-		case "-out":
-			if i+1 < len(os.Args[3:])-1 {
-				outFile = os.Args[i+4]
+			hasError := false
+			for _, iss := range issues {
+				if iss.Severity == "error" {
+					hasError = true
+				}
+			}
+			if hasError {
+				log.Fatal("metadata validation failed with errors")
 			}
 		}
 	}
@@ -158,24 +190,53 @@ func cmdGenerate() {
 		log.Fatalf("generate BOM: %v", err)
 	}
 
+	// Attach evidence if provided
+	if *evidenceFile != "" {
+		items, err := ImportEvidence(*evidenceFile)
+		if err != nil {
+			log.Fatalf("import evidence: %v", err)
+		}
+		targetRef := *evidenceComp
+		if targetRef == "" && len(bom.Components) > 0 {
+			targetRef = bom.Components[0].BOMRef
+		}
+		if !AttachEvidence(bom, targetRef, items) {
+			log.Fatalf("component not found: %s", targetRef)
+		}
+	}
+
+	// Apply privacy redaction if requested
+	if *privacyFlag != "" {
+		profile := resolvePrivacyProfile(*privacyFlag)
+		bom = RedactBOM(bom, profile)
+	}
+
+	// Validate generated BOM
+	if issues := ValidateBOM(bom); len(issues) > 0 {
+		for _, iss := range issues {
+			if iss.Severity == "error" {
+				log.Printf("BOM validation %s: %s: %s", iss.Severity, iss.Field, iss.Message)
+			}
+		}
+	}
+
 	privKey := loadSigningKey()
 
 	var output interface{}
 	if privKey != nil {
-		sb := SignBOM(bom, privKey, "ai-model-bom")
-		output = sb
+		output = SignBOM(bom, privKey, "ai-model-bom")
 	} else {
 		output = bom
 	}
 
 	metricGenerated.Add(1)
 
-	if outFile != "" {
+	if *outFile != "" {
 		data, _ := json.MarshalIndent(output, "", "  ")
-		if err := os.WriteFile(outFile, data, 0o644); err != nil {
+		if err := os.WriteFile(*outFile, data, 0o644); err != nil {
 			log.Fatalf("write output: %v", err)
 		}
-		fmt.Printf("BOM written to %s (%d components)\n", outFile, len(bom.Components))
+		fmt.Printf("BOM written to %s (%d components)\n", *outFile, len(bom.Components))
 	} else {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -183,12 +244,19 @@ func cmdGenerate() {
 	}
 }
 
-func cmdVerify() {
-	if len(os.Args) < 3 {
-		log.Fatal("usage: ai-model-bom verify FILE")
+func cmdVerify(args []string) {
+	fs := flag.NewFlagSet("verify", flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: ai-model-bom verify FILE\n\nVerify a signed BOM's integrity and signature.\nSet VERIFY_KEY env to base64-encoded Ed25519 public key.\n")
+	}
+	fs.Parse(args)
+
+	if fs.NArg() < 1 {
+		fs.Usage()
+		os.Exit(1)
 	}
 
-	data, err := os.ReadFile(os.Args[2])
+	data, err := os.ReadFile(fs.Arg(0))
 	if err != nil {
 		log.Fatalf("read BOM: %v", err)
 	}
@@ -203,7 +271,6 @@ func cmdVerify() {
 		os.Exit(1)
 	}
 
-	// Load public key
 	pubKeyStr := os.Getenv("VERIFY_KEY")
 	if pubKeyStr == "" {
 		log.Fatal("set VERIFY_KEY env to base64 public key")
@@ -225,13 +292,20 @@ func cmdVerify() {
 	}
 }
 
-func cmdDiff() {
-	if len(os.Args) < 4 {
-		log.Fatal("usage: ai-model-bom diff OLD NEW")
+func cmdDiff(args []string) {
+	fs := flag.NewFlagSet("diff", flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: ai-model-bom diff OLD NEW\n\nCompare two BOMs and report trust-relevant changes.\n")
+	}
+	fs.Parse(args)
+
+	if fs.NArg() < 2 {
+		fs.Usage()
+		os.Exit(1)
 	}
 
-	oldBOM := loadBOMFile(os.Args[2])
-	newBOM := loadBOMFile(os.Args[3])
+	oldBOM := loadBOMFile(fs.Arg(0))
+	newBOM := loadBOMFile(fs.Arg(1))
 
 	result := DiffBOMs(oldBOM, newBOM)
 	metricDiffs.Add(1)
@@ -245,30 +319,25 @@ func cmdDiff() {
 	}
 }
 
-func cmdAttest() {
-	if len(os.Args) < 3 {
-		log.Fatal("usage: ai-model-bom attest BOM [-subject S] [-predicate P]")
+func cmdAttest(args []string) {
+	fs := flag.NewFlagSet("attest", flag.ExitOnError)
+	subject := fs.String("subject", "", "Subject (model name or hash)")
+	predicate := fs.String("predicate", "deployment-ready", "Predicate being attested")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: ai-model-bom attest BOM [flags]\n\nCreate a signed attestation for a model BOM.\n\nFlags:\n")
+		fs.PrintDefaults()
+	}
+	fs.Parse(args)
+
+	if fs.NArg() < 1 {
+		fs.Usage()
+		os.Exit(1)
 	}
 
-	bom := loadBOMFile(os.Args[2])
-	subject := ""
-	predicate := "deployment-ready"
+	bom := loadBOMFile(fs.Arg(0))
 
-	for i, arg := range os.Args[3:] {
-		switch arg {
-		case "-subject":
-			if i+1 < len(os.Args[3:])-1 {
-				subject = os.Args[i+4]
-			}
-		case "-predicate":
-			if i+1 < len(os.Args[3:])-1 {
-				predicate = os.Args[i+4]
-			}
-		}
-	}
-
-	if subject == "" && len(bom.Components) > 0 {
-		subject = bom.Components[0].Name
+	if *subject == "" && len(bom.Components) > 0 {
+		*subject = bom.Components[0].Name
 	}
 
 	// Collect evidence from BOM components
@@ -277,7 +346,7 @@ func cmdAttest() {
 		evidence = append(evidence, comp.Evidence...)
 	}
 
-	att := CreateAttestation(subject, predicate, "ai-model-bom", evidence)
+	att := CreateAttestation(*subject, *predicate, "ai-model-bom", evidence)
 
 	privKey := loadSigningKey()
 	if privKey != nil {
@@ -289,13 +358,22 @@ func cmdAttest() {
 	enc.Encode(att)
 }
 
-func cmdEvaluate() {
-	if len(os.Args) < 3 {
-		log.Fatal("usage: ai-model-bom evaluate BOM")
+func cmdEvaluate(args []string) {
+	fs := flag.NewFlagSet("evaluate", flag.ExitOnError)
+	configFile := fs.String("config", "", "Path to config YAML")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: ai-model-bom evaluate BOM [flags]\n\nCheck if a BOM meets deployment readiness criteria.\n\nFlags:\n")
+		fs.PrintDefaults()
+	}
+	fs.Parse(args)
+
+	if fs.NArg() < 1 {
+		fs.Usage()
+		os.Exit(1)
 	}
 
-	bom := loadBOMFile(os.Args[2])
-	cfg := loadConfig()
+	bom := loadBOMFile(fs.Arg(0))
+	cfg := loadConfig(*configFile)
 
 	fields := cfg.RequiredFields
 	if len(fields) == 0 {
@@ -317,12 +395,51 @@ func cmdEvaluate() {
 
 // ---------- HTTP daemon ----------
 
-func cmdServe() {
-	cfg := loadConfig()
+func cmdServe(args []string) {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	configFile := fs.String("config", "", "Path to config YAML")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: ai-model-bom serve [flags]\n\nRun as an HTTP daemon.\n\nFlags:\n")
+		fs.PrintDefaults()
+	}
+	fs.Parse(args)
+
+	cfg := loadConfig(*configFile)
 	privKey := loadSigningKey()
 	token := os.Getenv("SERVICE_TOKEN")
 
+	mux := buildMux(cfg, privKey, token)
+
+	addr := cfg.Daemon.BindAddr
+	if addr == "" {
+		addr = "127.0.0.1:8515"
+	}
+
+	readTimeout := cfg.Daemon.ReadTimeout
+	if readTimeout <= 0 {
+		readTimeout = 30
+	}
+	writeTimeout := cfg.Daemon.WriteTimeout
+	if writeTimeout <= 0 {
+		writeTimeout = 60
+	}
+
+	srv := &http.Server{
+		Addr:         addr,
+		Handler:      mux,
+		ReadTimeout:  time.Duration(readTimeout) * time.Second,
+		WriteTimeout: time.Duration(writeTimeout) * time.Second,
+	}
+
+	log.Printf("ai-model-bom serving on %s", addr)
+	log.Fatal(srv.ListenAndServe())
+}
+
+// buildMux constructs the HTTP handler. Exported for testing.
+func buildMux(cfg *ServiceConfig, privKey ed25519.PrivateKey, token string) *http.ServeMux {
 	mux := http.NewServeMux()
+
+	// ---------- unauthenticated ----------
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		metricHTTPReqs.Add(1)
@@ -330,10 +447,16 @@ func cmdServe() {
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
 
+	// ---------- authenticated endpoints ----------
+
 	mux.HandleFunc("/v1/generate", func(w http.ResponseWriter, r *http.Request) {
 		metricHTTPReqs.Add(1)
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkToken(r, token) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 
@@ -344,6 +467,24 @@ func cmdServe() {
 		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 			http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
 			return
+		}
+
+		// Validate path against allowlist
+		if !isPathAllowed(req.Path, cfg.Daemon.AllowedPaths) {
+			http.Error(w, `{"error":"path not in allowed_paths"}`, http.StatusForbidden)
+			return
+		}
+
+		// Validate metadata
+		if req.Metadata != nil {
+			if issues := ValidateMetadata(req.Metadata); len(issues) > 0 {
+				for _, iss := range issues {
+					if iss.Severity == "error" {
+						http.Error(w, fmt.Sprintf(`{"error":"metadata validation: %s"}`, iss.Message), http.StatusBadRequest)
+						return
+					}
+				}
+			}
 		}
 
 		bom, err := GenerateBOM(req.Path, req.Metadata)
@@ -367,6 +508,10 @@ func cmdServe() {
 		metricHTTPReqs.Add(1)
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkToken(r, token) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 
@@ -396,6 +541,10 @@ func cmdServe() {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		if !checkToken(r, token) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 
 		var req struct {
 			Old *ModelBOM `json:"old"`
@@ -422,6 +571,10 @@ func cmdServe() {
 		metricHTTPReqs.Add(1)
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkToken(r, token) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 
@@ -461,7 +614,7 @@ func cmdServe() {
 			Predicate string         `json:"predicate"`
 			Evidence  []EvidenceItem `json:"evidence"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 			http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
 			return
 		}
@@ -477,31 +630,30 @@ func cmdServe() {
 
 	mux.HandleFunc("/v1/metrics", func(w http.ResponseWriter, r *http.Request) {
 		metricHTTPReqs.Add(1)
+		if !checkToken(r, token) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]int64{
-			"generated_total":    metricGenerated.Load(),
-			"verified_total":     metricVerified.Load(),
-			"diffs_total":        metricDiffs.Load(),
+			"generated_total":     metricGenerated.Load(),
+			"verified_total":      metricVerified.Load(),
+			"diffs_total":         metricDiffs.Load(),
 			"http_requests_total": metricHTTPReqs.Load(),
 		})
 	})
 
-	addr := cfg.Daemon.BindAddr
-	if addr == "" {
-		addr = "127.0.0.1:8515"
-	}
-
-	log.Printf("ai-model-bom serving on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, mux))
+	return mux
 }
 
-func cmdKeygen() {
-	prefix := "ai-model-bom"
-	for i, arg := range os.Args[2:] {
-		if arg == "-out" && i+1 < len(os.Args[2:])-1 {
-			prefix = os.Args[i+3]
-		}
+func cmdKeygen(args []string) {
+	fs := flag.NewFlagSet("keygen", flag.ExitOnError)
+	prefix := fs.String("out", "ai-model-bom", "Output filename prefix")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: ai-model-bom keygen [flags]\n\nGenerate an Ed25519 keypair for BOM signing.\n\nFlags:\n")
+		fs.PrintDefaults()
 	}
+	fs.Parse(args)
 
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -511,10 +663,10 @@ func cmdKeygen() {
 	privB64 := base64.StdEncoding.EncodeToString(priv)
 	pubB64 := base64.StdEncoding.EncodeToString(pub)
 
-	os.WriteFile(prefix+".key", []byte(privB64+"\n"), 0o600)
-	os.WriteFile(prefix+".pub", []byte(pubB64+"\n"), 0o644)
+	os.WriteFile(*prefix+".key", []byte(privB64+"\n"), 0o600)
+	os.WriteFile(*prefix+".pub", []byte(pubB64+"\n"), 0o644)
 
-	fmt.Printf("Keys written: %s.key (private), %s.pub (public)\n", prefix, prefix)
+	fmt.Printf("Keys written: %s.key (private), %s.pub (public)\n", *prefix, *prefix)
 }
 
 // ---------- helpers ----------
@@ -545,4 +697,61 @@ func loadBOMFile(path string) *ModelBOM {
 		log.Fatalf("parse BOM: %v", err)
 	}
 	return &bom
+}
+
+// isPathAllowed checks if a path is under one of the allowed root directories.
+// An empty allowlist permits all paths (backwards compatibility).
+func isPathAllowed(path string, allowedPaths []string) bool {
+	if len(allowedPaths) == 0 {
+		return true
+	}
+
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	// Resolve symlinks in the resolved path
+	absPath, err = filepath.EvalSymlinks(absPath)
+	if err != nil {
+		return false
+	}
+
+	for _, allowed := range allowedPaths {
+		allowedAbs, err := filepath.Abs(allowed)
+		if err != nil {
+			continue
+		}
+		allowedAbs, err = filepath.EvalSymlinks(allowedAbs)
+		if err != nil {
+			continue
+		}
+		// Ensure it's a clean prefix check with path separator
+		if absPath == allowedAbs || strings.HasPrefix(absPath, allowedAbs+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+// resolvePrivacyProfile returns a PrivacyProfile from a flag value.
+func resolvePrivacyProfile(value string) PrivacyProfile {
+	switch strings.ToLower(value) {
+	case "none":
+		return PrivacyProfile{}
+	case "default":
+		return DefaultPrivacyProfile()
+	default:
+		// Try loading from YAML file
+		data, err := os.ReadFile(value)
+		if err != nil {
+			log.Printf("warning: could not read privacy profile %s, using default", value)
+			return DefaultPrivacyProfile()
+		}
+		var profile PrivacyProfile
+		if err := yaml.Unmarshal(data, &profile); err != nil {
+			log.Printf("warning: could not parse privacy profile %s, using default", value)
+			return DefaultPrivacyProfile()
+		}
+		return profile
+	}
 }
