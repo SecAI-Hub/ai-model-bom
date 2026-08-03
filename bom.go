@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -18,13 +19,13 @@ import (
 
 // ModelBOM is the top-level CycloneDX ML-BOM document.
 type ModelBOM struct {
-	BOMFormat      string         `json:"bomFormat" yaml:"bomFormat"`
-	SpecVersion    string         `json:"specVersion" yaml:"specVersion"`
-	Version        int            `json:"version" yaml:"version"`
-	SerialNumber   string         `json:"serialNumber" yaml:"serialNumber"`
-	Metadata       BOMMetadata    `json:"metadata" yaml:"metadata"`
-	Components     []Component    `json:"components" yaml:"components"`
-	Dependencies   []Dependency   `json:"dependencies,omitempty" yaml:"dependencies,omitempty"`
+	BOMFormat    string       `json:"bomFormat" yaml:"bomFormat"`
+	SpecVersion  string       `json:"specVersion" yaml:"specVersion"`
+	Version      int          `json:"version" yaml:"version"`
+	SerialNumber string       `json:"serialNumber" yaml:"serialNumber"`
+	Metadata     BOMMetadata  `json:"metadata" yaml:"metadata"`
+	Components   []Component  `json:"components" yaml:"components"`
+	Dependencies []Dependency `json:"dependencies,omitempty" yaml:"dependencies,omitempty"`
 }
 
 // Dependency records a CycloneDX dependency relationship.
@@ -35,9 +36,9 @@ type Dependency struct {
 
 // BOMMetadata describes when and how the BOM was generated.
 type BOMMetadata struct {
-	Timestamp string      `json:"timestamp" yaml:"timestamp"`
-	Tools     []BOMTool   `json:"tools" yaml:"tools"`
-	Component *Component  `json:"component,omitempty" yaml:"component,omitempty"`
+	Timestamp string     `json:"timestamp" yaml:"timestamp"`
+	Tools     []BOMTool  `json:"tools" yaml:"tools"`
+	Component *Component `json:"component,omitempty" yaml:"component,omitempty"`
 }
 
 // BOMTool identifies the tool that generated the BOM.
@@ -49,17 +50,17 @@ type BOMTool struct {
 
 // Component is a CycloneDX component (model, tokenizer, adapter, etc.).
 type Component struct {
-	Type            string         `json:"type" yaml:"type"`
-	BOMRef          string         `json:"bom-ref,omitempty" yaml:"bom-ref,omitempty"`
-	Name            string         `json:"name" yaml:"name"`
-	Version         string         `json:"version,omitempty" yaml:"version,omitempty"`
-	Description     string         `json:"description,omitempty" yaml:"description,omitempty"`
-	Hashes          []Hash         `json:"hashes,omitempty" yaml:"hashes,omitempty"`
-	Licenses        []License      `json:"licenses,omitempty" yaml:"licenses,omitempty"`
-	ExternalRefs    []ExternalRef  `json:"externalReferences,omitempty" yaml:"externalReferences,omitempty"`
-	Properties      []Property     `json:"properties,omitempty" yaml:"properties,omitempty"`
-	ModelCard       *ModelCard     `json:"modelCard,omitempty" yaml:"modelCard,omitempty"`
-	Evidence        []EvidenceItem `json:"evidence,omitempty" yaml:"evidence,omitempty"`
+	Type         string         `json:"type" yaml:"type"`
+	BOMRef       string         `json:"bom-ref,omitempty" yaml:"bom-ref,omitempty"`
+	Name         string         `json:"name" yaml:"name"`
+	Version      string         `json:"version,omitempty" yaml:"version,omitempty"`
+	Description  string         `json:"description,omitempty" yaml:"description,omitempty"`
+	Hashes       []Hash         `json:"hashes,omitempty" yaml:"hashes,omitempty"`
+	Licenses     []License      `json:"licenses,omitempty" yaml:"licenses,omitempty"`
+	ExternalRefs []ExternalRef  `json:"externalReferences,omitempty" yaml:"externalReferences,omitempty"`
+	Properties   []Property     `json:"properties,omitempty" yaml:"properties,omitempty"`
+	ModelCard    *ModelCard     `json:"modelCard,omitempty" yaml:"modelCard,omitempty"`
+	Evidence     []EvidenceItem `json:"evidence,omitempty" yaml:"evidence,omitempty"`
 }
 
 // Hash is a content hash (CycloneDX format).
@@ -101,28 +102,28 @@ type ModelCard struct {
 
 // Quantization records quantization lineage.
 type Quantization struct {
-	Method     string `json:"method" yaml:"method"`         // Q4_K_M, Q5_K_S, etc.
+	Method        string  `json:"method" yaml:"method"` // Q4_K_M, Q5_K_S, etc.
 	BitsPerWeight float64 `json:"bits_per_weight,omitempty" yaml:"bits_per_weight,omitempty"`
-	BaseModelHash string `json:"base_model_hash,omitempty" yaml:"base_model_hash,omitempty"`
-	QuantizedBy   string `json:"quantized_by,omitempty" yaml:"quantized_by,omitempty"`
-	QuantizedAt   string `json:"quantized_at,omitempty" yaml:"quantized_at,omitempty"`
+	BaseModelHash string  `json:"base_model_hash,omitempty" yaml:"base_model_hash,omitempty"`
+	QuantizedBy   string  `json:"quantized_by,omitempty" yaml:"quantized_by,omitempty"`
+	QuantizedAt   string  `json:"quantized_at,omitempty" yaml:"quantized_at,omitempty"`
 }
 
 // Tokenizer describes the tokenizer associated with a model.
 type Tokenizer struct {
-	Name    string `json:"name,omitempty" yaml:"name,omitempty"`
-	Type    string `json:"type,omitempty" yaml:"type,omitempty"` // BPE, SentencePiece, etc.
-	Hash    string `json:"hash,omitempty" yaml:"hash,omitempty"`
-	Source  string `json:"source,omitempty" yaml:"source,omitempty"`
+	Name   string `json:"name,omitempty" yaml:"name,omitempty"`
+	Type   string `json:"type,omitempty" yaml:"type,omitempty"` // BPE, SentencePiece, etc.
+	Hash   string `json:"hash,omitempty" yaml:"hash,omitempty"`
+	Source string `json:"source,omitempty" yaml:"source,omitempty"`
 }
 
 // Adapter represents a LoRA or other fine-tuning adapter.
 type Adapter struct {
-	Name       string `json:"name" yaml:"name"`
-	Type       string `json:"type" yaml:"type"` // lora, qlora, etc.
-	Rank       int    `json:"rank,omitempty" yaml:"rank,omitempty"`
-	Hash       string `json:"hash,omitempty" yaml:"hash,omitempty"`
-	BaseModel  string `json:"base_model,omitempty" yaml:"base_model,omitempty"`
+	Name      string `json:"name" yaml:"name"`
+	Type      string `json:"type" yaml:"type"` // lora, qlora, etc.
+	Rank      int    `json:"rank,omitempty" yaml:"rank,omitempty"`
+	Hash      string `json:"hash,omitempty" yaml:"hash,omitempty"`
+	BaseModel string `json:"base_model,omitempty" yaml:"base_model,omitempty"`
 }
 
 // ---------- BOM generation ----------
@@ -131,6 +132,8 @@ const bomToolVersion = "0.2.0"
 
 // MaxFileSize is the maximum model file size to hash (10 GiB).
 const MaxFileSize = 10 << 30
+
+const maxScanEntries = 200_000
 
 // GenerateBOM creates a BOM from a model directory or single file.
 func GenerateBOM(path string, meta *ModelMetadata) (*ModelBOM, error) {
@@ -144,6 +147,54 @@ func GenerateBOM(path string, meta *ModelMetadata) (*ModelBOM, error) {
 		return nil, fmt.Errorf("refusing to scan non-regular file: %s (mode=%s)", path, info.Mode())
 	}
 
+	var components []Component
+	if info.IsDir() {
+		components, err = scanDirectory(path, info, meta)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		comp, err := scanFile(path, meta)
+		if err != nil {
+			return nil, err
+		}
+		components = []Component{comp}
+	}
+	return assembleBOM(path, components, meta)
+}
+
+// GenerateBOMFromRoot inventories a target through an already-open os.Root.
+// Daemon allowlist roots are opened once at startup, so replacing an ancestor
+// after authorization cannot redirect hashing outside the approved tree.
+func GenerateBOMFromRoot(root *os.Root, relativePath, displayPath string, meta *ModelMetadata) (*ModelBOM, error) {
+	if root == nil || relativePath == "" || filepath.IsAbs(relativePath) || relativePath == ".." || strings.HasPrefix(relativePath, ".."+string(filepath.Separator)) {
+		return nil, errors.New("invalid rooted model target")
+	}
+	info, err := root.Lstat(relativePath)
+	if err != nil {
+		return nil, fmt.Errorf("inspect rooted model target: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || (!info.IsDir() && !info.Mode().IsRegular()) {
+		return nil, fmt.Errorf("refusing symlink or special rooted target %q", displayPath)
+	}
+
+	var components []Component
+	if info.IsDir() {
+		components, err = scanRootDirectory(root, relativePath, info, meta)
+	} else {
+		hash, hashedInfo, hashErr := hashRootRegularFileSHA256(root, relativePath)
+		if hashErr != nil {
+			return nil, hashErr
+		}
+		components = []Component{buildModelComponent(hashedInfo, hash, meta)}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return assembleBOM(displayPath, components, meta)
+}
+
+func assembleBOM(path string, components []Component, meta *ModelMetadata) (*ModelBOM, error) {
 	bom := &ModelBOM{
 		BOMFormat:    "CycloneDX",
 		SpecVersion:  "1.6",
@@ -157,20 +208,7 @@ func GenerateBOM(path string, meta *ModelMetadata) (*ModelBOM, error) {
 				Version: bomToolVersion,
 			}},
 		},
-	}
-
-	if info.IsDir() {
-		components, err := scanDirectory(path, meta)
-		if err != nil {
-			return nil, err
-		}
-		bom.Components = components
-	} else {
-		comp, err := scanFile(path, meta)
-		if err != nil {
-			return nil, err
-		}
-		bom.Components = []Component{comp}
+		Components: components,
 	}
 
 	// Wire lineage into generation when metadata has quantization/adapter info
@@ -185,6 +223,20 @@ func GenerateBOM(path string, meta *ModelMetadata) (*ModelBOM, error) {
 	if len(bom.Components) > 0 {
 		primary := bom.Components[0]
 		bom.Metadata.Component = &primary
+	}
+	modelCount := 0
+	for _, component := range bom.Components {
+		if component.Type == "machine-learning-model" {
+			modelCount++
+		}
+	}
+	if modelCount == 0 {
+		return nil, fmt.Errorf("no supported model files found in %q", path)
+	}
+	for _, issue := range ValidateBOM(bom) {
+		if issue.Severity == "error" {
+			return nil, fmt.Errorf("generated BOM is invalid: %s: %s", issue.Field, issue.Message)
+		}
 	}
 
 	return bom, nil
@@ -288,56 +340,125 @@ func buildDependencies(components []Component) []Dependency {
 
 // scanDirectory walks a directory and creates components for model files.
 // Rejects symlinks, devices, FIFOs, and files exceeding MaxFileSize.
-func scanDirectory(dir string, meta *ModelMetadata) ([]Component, error) {
+func scanDirectory(dir string, expectedRoot os.FileInfo, meta *ModelMetadata) ([]Component, error) {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, fmt.Errorf("open scan root: %w", err)
+	}
+	defer root.Close()
+	openedRoot, err := root.Lstat(".")
+	if err != nil || !os.SameFile(expectedRoot, openedRoot) || !openedRoot.IsDir() {
+		return nil, fmt.Errorf("scan root changed while opening")
+	}
+	return scanRootDirectory(root, ".", openedRoot, meta)
+}
+
+func scanRootDirectory(root *os.Root, startDir string, expectedRoot os.FileInfo, meta *ModelMetadata) ([]Component, error) {
 	var components []Component
+	visitedEntries := 0
+	startInfo, err := root.Lstat(startDir)
+	if err != nil || !startInfo.IsDir() || !os.SameFile(expectedRoot, startInfo) {
+		return nil, fmt.Errorf("rooted scan target changed before enumeration")
+	}
 
-	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
-			return nil
+	pending := []string{startDir}
+	for len(pending) > 0 {
+		relDir := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		expectedDir, err := root.Lstat(relDir)
+		if err != nil || !expectedDir.IsDir() || expectedDir.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("scan directory %q changed or is not a real directory", relDir)
+		}
+		dirHandle, err := root.Open(relDir)
+		if err != nil {
+			return nil, fmt.Errorf("open scan directory %q: %w", relDir, err)
+		}
+		openedDir, err := dirHandle.Stat()
+		if err != nil || !os.SameFile(expectedDir, openedDir) {
+			_ = dirHandle.Close()
+			return nil, fmt.Errorf("scan directory %q changed while opening", relDir)
 		}
 
-		// Reject non-regular files (symlinks, devices, FIFOs, sockets)
-		if !info.Mode().IsRegular() {
-			return nil
-		}
+		for {
+			entries, readErr := dirHandle.ReadDir(256)
+			for _, entry := range entries {
+				visitedEntries++
+				if visitedEntries > maxScanEntries {
+					_ = dirHandle.Close()
+					return nil, fmt.Errorf("directory scan exceeds %d-entry limit", maxScanEntries)
+				}
+				relPath := filepath.Join(relDir, entry.Name())
+				info, err := root.Lstat(relPath)
+				if err != nil {
+					_ = dirHandle.Close()
+					return nil, fmt.Errorf("inspect %q: %w", relPath, err)
+				}
+				if info.Mode()&os.ModeSymlink != 0 || (!info.IsDir() && !info.Mode().IsRegular()) {
+					_ = dirHandle.Close()
+					return nil, fmt.Errorf("refusing symlink or special entry %q", relPath)
+				}
+				if info.IsDir() {
+					pending = append(pending, relPath)
+					continue
+				}
 
-		// Enforce max file size
-		if info.Size() > MaxFileSize {
-			return nil
-		}
-
-		ext := strings.ToLower(filepath.Ext(info.Name()))
-		switch ext {
-		case ".gguf", ".bin", ".safetensors", ".pt", ".onnx":
-			comp, err := scanFile(path, meta)
-			if err != nil {
-				return nil
+				ext := strings.ToLower(filepath.Ext(info.Name()))
+				isModel := ext == ".gguf" || ext == ".bin" || ext == ".safetensors" || ext == ".pt" || ext == ".onnx"
+				isTokenizer := ext == ".json" && isTokenizerFile(info.Name())
+				if !isModel && !isTokenizer {
+					continue
+				}
+				hash, hashedInfo, err := hashRootRegularFileSHA256(root, relPath)
+				if err != nil {
+					_ = dirHandle.Close()
+					return nil, err
+				}
+				if isModel {
+					comp := buildModelComponent(hashedInfo, hash, meta)
+					comp.BOMRef = filepath.ToSlash(relPath)
+					components = append(components, comp)
+				} else {
+					comp := tokenizerComponent(hashedInfo, hash)
+					comp.BOMRef = "tokenizer:" + filepath.ToSlash(relPath)
+					components = append(components, comp)
+				}
+				if len(components) > 100000 {
+					_ = dirHandle.Close()
+					return nil, errors.New("component count exceeds 100000")
+				}
 			}
-			components = append(components, comp)
-		case ".json":
-			if isTokenizerFile(info.Name()) {
-				comp := buildTokenizerComponent(path, info)
-				components = append(components, comp)
+			if readErr == io.EOF {
+				break
+			}
+			if readErr != nil {
+				_ = dirHandle.Close()
+				return nil, fmt.Errorf("enumerate scan directory %q: %w", relDir, readErr)
 			}
 		}
-		return nil
-	})
+		if after, err := dirHandle.Stat(); err != nil || !os.SameFile(openedDir, after) ||
+			!after.ModTime().Equal(openedDir.ModTime()) {
+			_ = dirHandle.Close()
+			return nil, fmt.Errorf("scan directory %q changed while enumerating", relDir)
+		}
+		if err := dirHandle.Close(); err != nil {
+			return nil, err
+		}
+	}
 
-	return components, err
+	return components, nil
 }
 
 // scanFile creates a component from a single model file.
 func scanFile(path string, meta *ModelMetadata) (Component, error) {
-	info, err := os.Stat(path)
+	hash, info, err := hashRegularFileSHA256(path)
 	if err != nil {
 		return Component{}, err
 	}
 
-	hash, err := hashFileSHA256(path)
-	if err != nil {
-		return Component{}, err
-	}
+	return buildModelComponent(info, hash, meta), nil
+}
 
+func buildModelComponent(info os.FileInfo, hash string, meta *ModelMetadata) Component {
 	name := info.Name()
 	comp := Component{
 		Type:   "machine-learning-model",
@@ -370,12 +491,22 @@ func scanFile(path string, meta *ModelMetadata) (Component, error) {
 		applyMetadata(&comp, meta)
 	}
 
-	return comp, nil
+	return comp
 }
 
 // buildTokenizerComponent creates a component for a tokenizer file.
-func buildTokenizerComponent(path string, info os.FileInfo) Component {
-	hash, _ := hashFileSHA256(path)
+func buildTokenizerComponent(path string, info os.FileInfo) (Component, error) {
+	hash, hashedInfo, err := hashRegularFileSHA256(path)
+	if err != nil {
+		return Component{}, err
+	}
+	if !os.SameFile(info, hashedInfo) {
+		return Component{}, fmt.Errorf("tokenizer file %q changed while being scanned", path)
+	}
+	return tokenizerComponent(hashedInfo, hash), nil
+}
+
+func tokenizerComponent(info os.FileInfo, hash string) Component {
 	return Component{
 		Type:   "data",
 		BOMRef: "tokenizer:" + info.Name(),
@@ -521,16 +652,97 @@ func isTokenizerFile(name string) bool {
 
 // ---------- helpers ----------
 
-func hashFileSHA256(path string) (string, error) {
+func hashRegularFileSHA256(path string) (string, os.FileInfo, error) {
+	pathInfo, err := os.Lstat(path)
+	if err != nil {
+		return "", nil, err
+	}
+	if !pathInfo.Mode().IsRegular() {
+		return "", nil, fmt.Errorf("refusing non-regular file %q", path)
+	}
+	if pathInfo.Size() > MaxFileSize {
+		return "", nil, fmt.Errorf("file %q exceeds %d-byte limit", path, MaxFileSize)
+	}
+
+	// #nosec G304 -- path is the caller-selected model input and is pinned to
+	// the regular-file identity established by Lstat immediately above.
 	f, err := os.Open(path)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	defer f.Close()
+	before, err := f.Stat()
+	if err != nil {
+		return "", nil, err
+	}
+	if !before.Mode().IsRegular() || !os.SameFile(pathInfo, before) ||
+		pathInfo.Size() != before.Size() || !pathInfo.ModTime().Equal(before.ModTime()) {
+		return "", nil, fmt.Errorf("file %q changed while being opened", path)
+	}
 
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
+	written, err := io.Copy(h, io.LimitReader(f, MaxFileSize+1))
+	if err != nil {
+		return "", nil, err
 	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	if written > MaxFileSize {
+		return "", nil, fmt.Errorf("file %q exceeds %d-byte limit", path, MaxFileSize)
+	}
+	after, err := f.Stat()
+	if err != nil {
+		return "", nil, err
+	}
+	if !os.SameFile(before, after) || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+		return "", nil, fmt.Errorf("file %q changed while being hashed", path)
+	}
+	pathAfter, err := os.Lstat(path)
+	if err != nil || !os.SameFile(after, pathAfter) || after.Size() != pathAfter.Size() ||
+		!after.ModTime().Equal(pathAfter.ModTime()) {
+		return "", nil, fmt.Errorf("file path %q changed while being hashed", path)
+	}
+	return hex.EncodeToString(h.Sum(nil)), after, nil
+}
+
+func hashRootRegularFileSHA256(root *os.Root, relativePath string) (string, os.FileInfo, error) {
+	pathInfo, err := root.Lstat(relativePath)
+	if err != nil {
+		return "", nil, err
+	}
+	if !pathInfo.Mode().IsRegular() || pathInfo.Mode()&os.ModeSymlink != 0 {
+		return "", nil, fmt.Errorf("refusing non-regular file %q", relativePath)
+	}
+	if pathInfo.Size() > MaxFileSize {
+		return "", nil, fmt.Errorf("file %q exceeds %d-byte limit", relativePath, MaxFileSize)
+	}
+
+	f, err := root.Open(relativePath)
+	if err != nil {
+		return "", nil, err
+	}
+	defer f.Close()
+	before, err := f.Stat()
+	if err != nil || !before.Mode().IsRegular() || !os.SameFile(pathInfo, before) ||
+		pathInfo.Size() != before.Size() || !pathInfo.ModTime().Equal(before.ModTime()) {
+		return "", nil, fmt.Errorf("file %q changed while being opened", relativePath)
+	}
+
+	h := sha256.New()
+	written, err := io.Copy(h, io.LimitReader(f, MaxFileSize+1))
+	if err != nil {
+		return "", nil, err
+	}
+	if written > MaxFileSize {
+		return "", nil, fmt.Errorf("file %q exceeds %d-byte limit", relativePath, MaxFileSize)
+	}
+	after, err := f.Stat()
+	if err != nil || !os.SameFile(before, after) || before.Size() != after.Size() ||
+		!before.ModTime().Equal(after.ModTime()) {
+		return "", nil, fmt.Errorf("file %q changed while being hashed", relativePath)
+	}
+	pathAfter, err := root.Lstat(relativePath)
+	if err != nil || !os.SameFile(after, pathAfter) || after.Size() != pathAfter.Size() ||
+		!after.ModTime().Equal(pathAfter.ModTime()) {
+		return "", nil, fmt.Errorf("file path %q changed while being hashed", relativePath)
+	}
+	return hex.EncodeToString(h.Sum(nil)), after, nil
 }

@@ -8,9 +8,9 @@ import (
 
 // DiffResult describes differences between two BOMs.
 type DiffResult struct {
-	Summary       string         `json:"summary"`
-	TrustRelevant bool           `json:"trust_relevant"`
-	Changes       []DiffChange   `json:"changes"`
+	Summary       string       `json:"summary"`
+	TrustRelevant bool         `json:"trust_relevant"`
+	Changes       []DiffChange `json:"changes"`
 }
 
 // DiffChange is a single difference between two BOMs.
@@ -26,6 +26,12 @@ type DiffChange struct {
 // DiffBOMs compares two model BOMs and returns trust-relevant differences.
 func DiffBOMs(old, new *ModelBOM) DiffResult {
 	result := DiffResult{}
+	if old == nil || new == nil {
+		result.TrustRelevant = true
+		result.Summary = "comparison requires two non-nil BOMs"
+		result.Changes = []DiffChange{{Category: "metadata", Severity: "critical", Field: "bom", Message: result.Summary}}
+		return result
+	}
 
 	// Index components by bom-ref or name
 	oldComps := indexComponents(old.Components)
@@ -99,13 +105,13 @@ func diffComponents(old, new Component) []DiffChange {
 	// Hash comparison (trust-critical)
 	oldHash := extractHash(old.Hashes)
 	newHash := extractHash(new.Hashes)
-	if oldHash != "" && newHash != "" && oldHash != newHash {
+	if oldHash != newHash {
 		changes = append(changes, DiffChange{
 			Category: "hash",
 			Severity: "critical",
 			Field:    prefix + ".hash",
-			OldValue: oldHash[:16] + "...",
-			NewValue: newHash[:16] + "...",
+			OldValue: abbreviatedHash(oldHash),
+			NewValue: abbreviatedHash(newHash),
 			Message:  fmt.Sprintf("%s: content hash changed (model binary differs)", prefix),
 		})
 	}
@@ -155,6 +161,13 @@ func diffComponents(old, new Component) []DiffChange {
 	}
 
 	return changes
+}
+
+func abbreviatedHash(value string) string {
+	if len(value) <= 16 {
+		return value
+	}
+	return value[:16] + "..."
 }
 
 // diffModelCards compares model card fields.

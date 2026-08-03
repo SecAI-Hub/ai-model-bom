@@ -1,0 +1,12 @@
+.git
+.github
+*.md
+SECURITY_AUDIT.md
+ai-model-bom
+coverage.out
+dist
+*.key
+*.pub
+*.json
+*.jsonl
+models

@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
@@ -275,8 +277,8 @@ func TestEvidence_Import(t *testing.T) {
 	dir := t.TempDir()
 	evidenceFile := filepath.Join(dir, "evidence.json")
 	os.WriteFile(evidenceFile, []byte(`[
-		{"type":"scan","source":"ai-quarantine","result":"pass","description":"virus scan clean"},
-		{"type":"test","source":"gguf-guard","result":"pass","description":"GGUF header valid"}
+		{"type":"scan","source":"ai-quarantine","timestamp":"2026-08-02T00:00:00Z","result":"pass","description":"virus scan clean"},
+		{"type":"test","source":"gguf-guard","timestamp":"2026-08-02T00:00:00Z","result":"pass","description":"GGUF header valid"}
 	]`), 0o644)
 
 	items, err := ImportEvidence(evidenceFile)
@@ -320,10 +322,12 @@ func TestAttestation_SignAndVerify(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 
 	att := CreateAttestation("model.gguf", "deployment-ready", "test", []EvidenceItem{
-		{Type: "scan", Result: "pass", Description: "clean"},
+		{Type: "scan", Source: "scanner", Timestamp: "2026-08-02T00:00:00Z", Result: "pass", Description: "clean"},
 	})
 
-	SignAttestation(&att, priv)
+	if err := SignAttestation(&att, priv); err != nil {
+		t.Fatal(err)
+	}
 	if att.Signature == "" {
 		t.Error("expected signature")
 	}
@@ -336,8 +340,12 @@ func TestAttestation_SignAndVerify(t *testing.T) {
 func TestAttestation_TamperDetection(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 
-	att := CreateAttestation("model.gguf", "safe", "tester", nil)
-	SignAttestation(&att, priv)
+	att := CreateAttestation("model.gguf", "safe", "tester", []EvidenceItem{{
+		Type: "scan", Source: "scanner", Timestamp: "2026-08-02T00:00:00Z", Result: "pass",
+	}})
+	if err := SignAttestation(&att, priv); err != nil {
+		t.Fatal(err)
+	}
 
 	att.Predicate = "unsafe"
 	if VerifyAttestation(att, pub) {
@@ -345,19 +353,30 @@ func TestAttestation_TamperDetection(t *testing.T) {
 	}
 }
 
+func validTestBOM() *ModelBOM {
+	return &ModelBOM{
+		BOMFormat:    "CycloneDX",
+		SpecVersion:  "1.6",
+		Version:      1,
+		SerialNumber: "urn:uuid:test",
+		Components: []Component{{
+			Type:   "machine-learning-model",
+			BOMRef: "test.gguf",
+			Name:   "test.gguf",
+			Hashes: []Hash{{Algorithm: "SHA-256", Content: strings.Repeat("a", 64)}},
+		}},
+	}
+}
+
 func TestSignedBOM_Verify(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 
-	bom := &ModelBOM{
-		BOMFormat:   "CycloneDX",
-		SpecVersion: "1.6",
-		Version:     1,
-		Components: []Component{
-			{Name: "test.gguf", Hashes: []Hash{{Algorithm: "SHA-256", Content: "abc123"}}},
-		},
-	}
+	bom := validTestBOM()
 
-	sb := SignBOM(bom, priv, "test")
+	sb, err := SignBOM(bom, priv, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
 	valid, reason := VerifySignedBOM(sb, pub)
 	if !valid {
 		t.Errorf("signed BOM should verify: %s", reason)
@@ -367,8 +386,11 @@ func TestSignedBOM_Verify(t *testing.T) {
 func TestSignedBOM_TamperDetection(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 
-	bom := &ModelBOM{BOMFormat: "CycloneDX", SpecVersion: "1.6", Version: 1}
-	sb := SignBOM(bom, priv, "test")
+	bom := validTestBOM()
+	sb, err := SignBOM(bom, priv, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	sb.BOM.Version = 99
 	valid, _ := VerifySignedBOM(sb, pub)
@@ -377,14 +399,100 @@ func TestSignedBOM_TamperDetection(t *testing.T) {
 	}
 }
 
+func TestSignedBOMMetadataTamperDetection(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	sb, err := SignBOM(validTestBOM(), priv, "trusted-signer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb.SignedBy = "attacker"
+	if valid, _ := VerifySignedBOM(sb, pub); valid {
+		t.Fatal("signed-by tampering must invalidate the signature")
+	}
+}
+
+func TestVerifySignedBOMRejectsStructurallyInvalidSignedContent(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	bom := validTestBOM()
+	bom.Components[0].BOMRef = ""
+	data, _ := json.Marshal(bom)
+	hash := sha256.Sum256(data)
+	hashText := hex.EncodeToString(hash[:])
+	signedAt := "2026-08-02T00:00:00Z"
+	payload, err := signedBOMSignaturePayload("1", hashText, signedAt, "malicious-signer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb := SignedBOM{
+		BOM: bom, Hash: hashText, Signature: hex.EncodeToString(ed25519.Sign(priv, payload)),
+		SignatureVersion: "1", SignedAt: signedAt, SignedBy: "malicious-signer",
+	}
+	if valid, reason := VerifySignedBOM(sb, pub); valid || !strings.Contains(reason, "structural") {
+		t.Fatalf("structurally invalid signed content was accepted: valid=%t reason=%q", valid, reason)
+	}
+}
+
+func TestReadRegularFileRejectsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.json")
+	if err := os.WriteFile(target, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "input.json")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readRegularFile(link, maxBOMBytes); err == nil {
+		t.Fatal("symlinked input must be rejected")
+	}
+}
+
+func TestLoadServiceTokenRejectsWhitespace(t *testing.T) {
+	t.Setenv("SERVICE_TOKEN", strings.Repeat("a", 32)+" "+strings.Repeat("b", 32))
+	t.Setenv("SERVICE_TOKEN_PATH", "")
+	if _, err := loadServiceToken(); err == nil {
+		t.Fatal("service token containing whitespace must be rejected")
+	}
+}
+
+func TestEvaluateReadinessRequiresPassingEvidence(t *testing.T) {
+	bom := validTestBOM()
+	bom.Components[0].Evidence = []EvidenceItem{{
+		Type: "scan", Source: "scanner", Timestamp: "2026-08-02T00:00:00Z", Result: "info",
+	}}
+	ready, missing := EvaluateReadiness(bom, []string{"evidence"})
+	if ready || len(missing) == 0 {
+		t.Fatalf("informational evidence must not satisfy a passing-evidence requirement: %v", missing)
+	}
+}
+
+func TestEvaluateReadinessRejectsEmptyTrustFields(t *testing.T) {
+	bom := validTestBOM()
+	bom.Components[0].Licenses = []License{{}}
+	bom.Components[0].ExternalRefs = []ExternalRef{{Type: "distribution"}}
+	bom.Components[0].ModelCard = &ModelCard{
+		TrustLabels:  []string{"  "},
+		Quantization: &Quantization{},
+	}
+	ready, missing := EvaluateReadiness(bom, []string{"license", "source", "trust_labels", "quantization"})
+	if ready || len(missing) < 4 {
+		t.Fatalf("empty trust fields must not satisfy readiness: %v", missing)
+	}
+}
+
 // ---------- readiness evaluation tests ----------
 
 func TestEvaluateReadiness_Pass(t *testing.T) {
 	bom := &ModelBOM{
+		BOMFormat:    "CycloneDX",
+		SpecVersion:  "1.6",
+		Version:      1,
+		SerialNumber: "urn:uuid:test",
 		Components: []Component{{
 			Type:     "machine-learning-model",
+			BOMRef:   "model.gguf",
 			Name:     "model.gguf",
-			Hashes:   []Hash{{Algorithm: "SHA-256", Content: "abc"}},
+			Hashes:   []Hash{{Algorithm: "SHA-256", Content: strings.Repeat("a", 64)}},
 			Licenses: []License{{Name: "MIT"}},
 			ModelCard: &ModelCard{
 				TrustLabels: []string{"verified"},
@@ -400,9 +508,14 @@ func TestEvaluateReadiness_Pass(t *testing.T) {
 
 func TestEvaluateReadiness_Fail(t *testing.T) {
 	bom := &ModelBOM{
+		BOMFormat:    "CycloneDX",
+		SpecVersion:  "1.6",
+		Version:      1,
+		SerialNumber: "urn:uuid:test",
 		Components: []Component{{
-			Type: "machine-learning-model",
-			Name: "bare.gguf",
+			Type:   "machine-learning-model",
+			BOMRef: "bare.gguf",
+			Name:   "bare.gguf",
 		}},
 	}
 
@@ -694,8 +807,8 @@ func TestRedactBOM_FullProfile(t *testing.T) {
 // ---------- path allowlist tests ----------
 
 func TestIsPathAllowed_EmptyAllowlist(t *testing.T) {
-	if !isPathAllowed("/any/path", nil) {
-		t.Error("empty allowlist should permit all")
+	if isPathAllowed("/any/path", nil) {
+		t.Error("empty allowlist must deny all paths")
 	}
 }
 
@@ -719,14 +832,20 @@ func TestIsPathAllowed_NotMatching(t *testing.T) {
 // ---------- privacy profile resolution ----------
 
 func TestResolvePrivacyProfile_None(t *testing.T) {
-	p := resolvePrivacyProfile("none")
+	p, err := resolvePrivacyProfile("none")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if p.StripEmails || p.StripPaths || p.StripHostnames || p.StripUsernames {
 		t.Error("'none' profile should strip nothing")
 	}
 }
 
 func TestResolvePrivacyProfile_Default(t *testing.T) {
-	p := resolvePrivacyProfile("default")
+	p, err := resolvePrivacyProfile("default")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !p.StripEmails || !p.StripPaths || !p.StripHostnames || !p.StripUsernames {
 		t.Error("'default' profile should strip all categories")
 	}
@@ -734,16 +853,27 @@ func TestResolvePrivacyProfile_Default(t *testing.T) {
 
 // ---------- HTTP handler tests ----------
 
-func buildTestMux(t *testing.T) *http.ServeMux {
+var testServiceToken = strings.Repeat("unit-test-token-", 3)
+
+func buildTestMux(t *testing.T) http.Handler {
 	t.Helper()
-	return buildTestMuxWithToken(t, "")
+	mux := buildTestMuxWithToken(t, testServiceToken)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Header.Set("Authorization", "Bearer "+testServiceToken)
+		mux.ServeHTTP(w, r)
+	})
 }
 
 func buildTestMuxWithToken(t *testing.T, token string) *http.ServeMux {
 	t.Helper()
-	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	cfg := &ServiceConfig{Version: 1}
-	return buildMux(cfg, priv, token)
+	requireSigned := false
+	cfg.RequireSignedTrustInputs = &requireSigned
+	// Most handler tests exercise behavior rather than role separation, so use
+	// the same fixture value for both roles. Dedicated tests below assert that
+	// production wiring rejects a normal service token for signing operations.
+	return buildMuxWithTokens(cfg, priv, pub, token, token)
 }
 
 func TestHTTP_Health(t *testing.T) {
@@ -766,7 +896,8 @@ func TestHTTP_HealthNoAuth(t *testing.T) {
 
 func TestHTTP_Diff(t *testing.T) {
 	mux := buildTestMux(t)
-	body := `{"old":{"components":[{"name":"m","bom-ref":"m"}]},"new":{"components":[{"name":"m","bom-ref":"m"}]}}`
+	bomJSON := `{"bomFormat":"CycloneDX","specVersion":"1.6","version":1,"serialNumber":"urn:uuid:test","metadata":{"timestamp":"","tools":[]},"components":[{"type":"machine-learning-model","name":"m","bom-ref":"m","hashes":[{"alg":"SHA-256","content":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}]}`
+	body := `{"old":` + bomJSON + `,"new":` + bomJSON + `}`
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, httptest.NewRequest("POST", "/v1/diff", strings.NewReader(body)))
 	if w.Code != 200 {
@@ -777,7 +908,7 @@ func TestHTTP_Diff(t *testing.T) {
 func TestHTTP_Evaluate(t *testing.T) {
 	mux := buildTestMux(t)
 	// Must satisfy default required_fields: hash, license, model_card
-	body := `{"components":[{"type":"machine-learning-model","name":"m","hashes":[{"alg":"SHA-256","content":"abc"}],"licenses":[{"name":"MIT"}],"modelCard":{}}]}`
+	body := `{"bomFormat":"CycloneDX","specVersion":"1.6","version":1,"serialNumber":"urn:uuid:test","metadata":{"timestamp":"","tools":[]},"components":[{"type":"machine-learning-model","bom-ref":"m","name":"m","hashes":[{"alg":"SHA-256","content":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"licenses":[{"name":"MIT"}],"modelCard":{}}]}`
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, httptest.NewRequest("POST", "/v1/evaluate", strings.NewReader(body)))
 	if w.Code != 200 {
@@ -790,6 +921,45 @@ func TestHTTP_Evaluate(t *testing.T) {
 	}
 }
 
+func TestHTTPTrustEndpointsRequireSignedInputsByDefault(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	cfg := &ServiceConfig{Version: 1}
+	mux := buildMuxWithVerifyKey(cfg, priv, pub, testServiceToken)
+	raw, err := json.Marshal(validTestBOM())
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/evaluate", bytes.NewReader(raw))
+	req.Header.Set("Authorization", "Bearer "+testServiceToken)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("unsigned readiness input must be rejected, got %d", w.Code)
+	}
+
+	signed, err := SignBOM(validTestBOM(), priv, "trusted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	signedJSON, _ := json.Marshal(signed)
+	req = httptest.NewRequest(http.MethodPost, "/v1/evaluate", bytes.NewReader(signedJSON))
+	req.Header.Set("Authorization", "Bearer "+testServiceToken)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"input_verified":true`) {
+		t.Fatalf("signed readiness input was not verified: code=%d body=%s", w.Code, w.Body.String())
+	}
+
+	diffBody, _ := json.Marshal(map[string]SignedBOM{"old": signed, "new": signed})
+	req = httptest.NewRequest(http.MethodPost, "/v1/diff", bytes.NewReader(diffBody))
+	req.Header.Set("Authorization", "Bearer "+testServiceToken)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || w.Header().Get("SecAI-Input-Verified") != "true" {
+		t.Fatalf("signed diff inputs were not verified: code=%d header=%q", w.Code, w.Header().Get("SecAI-Input-Verified"))
+	}
+}
+
 func TestHTTP_AttestRequiresToken(t *testing.T) {
 	mux := buildTestMuxWithToken(t, "secret123")
 
@@ -799,7 +969,7 @@ func TestHTTP_AttestRequiresToken(t *testing.T) {
 		t.Errorf("expected 401 without token, got %d", w.Code)
 	}
 
-	req := httptest.NewRequest("POST", "/v1/attest", strings.NewReader(`{"subject":"m","predicate":"safe"}`))
+	req := httptest.NewRequest("POST", "/v1/attest", strings.NewReader(`{"subject":"m","predicate":"safe","evidence":[{"type":"scan","source":"unit-test","timestamp":"2026-08-02T00:00:00Z","result":"pass"}]}`))
 	req.Header.Set("Authorization", "Bearer secret123")
 	w = httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
@@ -840,16 +1010,122 @@ func TestHTTP_AllEndpointsRequireAuth(t *testing.T) {
 }
 
 func TestHTTP_GeneratePathAllowlist(t *testing.T) {
-	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	cfg := &ServiceConfig{Version: 1}
 	cfg.Daemon.AllowedPaths = []string{"/only/this/dir"}
-	mux := buildMux(cfg, priv, "")
+	mux := buildMuxWithTokens(cfg, priv, pub, testServiceToken, testServiceToken)
 
 	body := `{"path":"/etc/passwd"}`
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, httptest.NewRequest("POST", "/v1/generate", strings.NewReader(body)))
+	req := httptest.NewRequest("POST", "/v1/generate", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+testServiceToken)
+	mux.ServeHTTP(w, req)
 	if w.Code != 403 {
 		t.Errorf("expected 403 for disallowed path, got %d", w.Code)
+	}
+}
+
+func TestPinnedAllowlistRootSurvivesAncestorReplacement(t *testing.T) {
+	parent := t.TempDir()
+	allowed := filepath.Join(parent, "allowed")
+	moved := filepath.Join(parent, "allowed-original")
+	outside := filepath.Join(parent, "outside")
+	if err := os.Mkdir(allowed, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(outside, 0700); err != nil {
+		t.Fatal(err)
+	}
+	safeBytes := []byte("approved-model")
+	if err := os.WriteFile(filepath.Join(allowed, "model.gguf"), safeBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "model.gguf"), []byte("outside-model"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	roots, err := openAllowedRoots([]string{allowed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeAllowedRoots(roots)
+	root, relative, display, ok := resolveAllowedTarget(filepath.Join(allowed, "model.gguf"), roots)
+	if !ok {
+		t.Fatal("expected target to resolve before replacement")
+	}
+	if err := os.Rename(allowed, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, allowed); err != nil {
+		t.Fatal(err)
+	}
+
+	bom, err := GenerateBOMFromRoot(root.root, relative, display, nil)
+	if err != nil {
+		t.Fatalf("pinned root should remain usable after pathname replacement: %v", err)
+	}
+	wantHash := sha256.Sum256(safeBytes)
+	if got := bom.Components[0].Hashes[0].Content; got != hex.EncodeToString(wantHash[:]) {
+		t.Fatalf("ancestor replacement escaped pinned root: got hash %s", got)
+	}
+}
+
+func TestHTTPSigningEndpointsRequireSeparateAuthority(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	normalToken := strings.Repeat("normal-service-token-", 2)
+	signingToken := strings.Repeat("signing-authority-token-", 2)
+	modelDir := t.TempDir()
+	modelPath := filepath.Join(modelDir, "model.gguf")
+	if err := os.WriteFile(modelPath, []byte("model"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &ServiceConfig{Version: 1}
+	cfg.Daemon.AllowedPaths = []string{modelDir}
+	mux := buildMuxWithTokens(cfg, priv, pub, normalToken, signingToken)
+	body := `{"subject":"m","predicate":"safe","evidence":[{"type":"scan","source":"unit-test","timestamp":"2026-08-02T00:00:00Z","result":"pass"}]}`
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/attest", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+normalToken)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("ordinary service token must not mint attestations, got %d", w.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/v1/attest", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+signingToken)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("signing authority token was rejected: code=%d body=%s", w.Code, w.Body.String())
+	}
+
+	generateBody, _ := json.Marshal(map[string]string{"path": modelPath})
+	req = httptest.NewRequest(http.MethodPost, "/v1/generate", bytes.NewReader(generateBody))
+	req.Header.Set("Authorization", "Bearer "+normalToken)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("ordinary service token must not mint signed BOMs, got %d", w.Code)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/v1/generate", bytes.NewReader(generateBody))
+	req.Header.Set("Authorization", "Bearer "+signingToken)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"signed_bom"`) {
+		t.Fatalf("signing authority could not generate a signed BOM: code=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestHTTPSigningEndpointsFailClosedWithoutSigningToken(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	mux := buildMuxWithTokens(&ServiceConfig{Version: 1}, priv, pub, testServiceToken, "")
+	req := httptest.NewRequest(http.MethodPost, "/v1/attest", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer "+testServiceToken)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("missing signing authority must fail closed, got %d", w.Code)
 	}
 }
 
@@ -866,8 +1142,8 @@ func TestHTTP_Metrics(t *testing.T) {
 
 func TestCheckToken_Empty(t *testing.T) {
 	r := httptest.NewRequest("GET", "/", nil)
-	if !checkToken(r, "") {
-		t.Error("empty token should allow all")
+	if checkToken(r, "") {
+		t.Error("empty token must fail closed")
 	}
 }
 
@@ -884,6 +1160,187 @@ func TestCheckToken_Invalid(t *testing.T) {
 	r.Header.Set("Authorization", "Bearer wrong")
 	if checkToken(r, "right") {
 		t.Error("invalid token should fail")
+	}
+}
+
+func TestHTTP_MissingTokenConfigurationFailsClosed(t *testing.T) {
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	mux := buildMux(&ServiceConfig{Version: 1}, priv, "")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/metrics", nil))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", w.Code)
+	}
+}
+
+func TestHTTP_RateLimit(t *testing.T) {
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	cfg := &ServiceConfig{Version: 1}
+	cfg.Daemon.RequestsPerMinute = 1
+	mux := buildMux(cfg, priv, testServiceToken)
+	for attempt := 1; attempt <= 2; attempt++ {
+		req := httptest.NewRequest(http.MethodGet, "/v1/metrics", nil)
+		req.Header.Set("Authorization", "Bearer "+testServiceToken)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		if attempt == 1 && w.Code != http.StatusOK {
+			t.Fatalf("first request returned %d", w.Code)
+		}
+		if attempt == 2 && w.Code != http.StatusTooManyRequests {
+			t.Fatalf("second request returned %d", w.Code)
+		}
+	}
+}
+
+func TestHTTP_RejectsUnknownAndTrailingJSON(t *testing.T) {
+	mux := buildTestMuxWithToken(t, testServiceToken)
+	for _, body := range []string{
+		`{"subject":"m","predicate":"safe","unexpected":true}`,
+		`{"subject":"m","predicate":"safe"} {}`,
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/v1/attest", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+testServiceToken)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for %q, got %d", body, w.Code)
+		}
+	}
+}
+
+func TestHTTP_AttestRequiresSigningKey(t *testing.T) {
+	mux := buildMux(&ServiceConfig{Version: 1}, nil, testServiceToken)
+	req := httptest.NewRequest(http.MethodPost, "/v1/attest", strings.NewReader(`{"subject":"m","predicate":"safe"}`))
+	req.Header.Set("Authorization", "Bearer "+testServiceToken)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", w.Code)
+	}
+}
+
+func TestSignBOMRejectsInvalidPrivateKey(t *testing.T) {
+	if _, err := SignBOM(validTestBOM(), ed25519.PrivateKey("short"), "test"); err == nil {
+		t.Fatal("expected invalid private key to be rejected")
+	}
+}
+
+func TestEvaluateReadinessRejectsFailedEvidence(t *testing.T) {
+	bom := validTestBOM()
+	bom.Components[0].Evidence = []EvidenceItem{{Type: "scan", Source: "scanner", Result: "fail"}}
+	ready, missing := EvaluateReadiness(bom, nil)
+	if ready || len(missing) == 0 {
+		t.Fatalf("failed evidence must block readiness: %v", missing)
+	}
+}
+
+func TestLoadConfigRejectsUnknownAndMultipleDocuments(t *testing.T) {
+	for _, content := range []string{
+		"version: 1\nunknown: true\n",
+		"version: 1\n---\nversion: 1\n",
+	} {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := loadConfig(path); err == nil {
+			t.Fatalf("expected invalid config to be rejected: %q", content)
+		}
+	}
+}
+
+func TestImportEvidenceRejectsUnknownFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "evidence.json")
+	if err := os.WriteFile(path, []byte(`{"type":"scan","result":"pass","unknown":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ImportEvidence(path); err == nil {
+		t.Fatal("expected unknown evidence field to be rejected")
+	}
+}
+
+func TestLoadSignedBOMRequiresAndUsesVerificationKey(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	signed, err := SignBOM(validTestBOM(), priv, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(signed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "signed.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("VERIFY_KEY", "")
+	t.Setenv("VERIFY_KEY_PATH", "")
+	if _, err := loadBOMFile(path); err == nil {
+		t.Fatal("expected a signed BOM without a verification key to be rejected")
+	}
+	t.Setenv("VERIFY_KEY", base64.StdEncoding.EncodeToString(pub))
+	if _, err := loadBOMFile(path); err != nil {
+		t.Fatalf("expected signed BOM to verify: %v", err)
+	}
+}
+
+func TestUnsignedBOMRequiresExplicitPolicy(t *testing.T) {
+	data, err := json.Marshal(validTestBOM())
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "bom.json")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadBOMFile(path); err == nil {
+		t.Fatal("unsigned BOM must be rejected by default")
+	}
+	if _, err := loadBOMFileWithPolicy(path, true); err != nil {
+		t.Fatalf("explicit structural-only unsigned load failed: %v", err)
+	}
+}
+
+func TestDirectoryBOMRejectsSymlinkEntries(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "model.gguf"), []byte("model"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(dir, "linked-directory")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := GenerateBOM(dir, nil); err == nil {
+		t.Fatal("directory inventory must reject symlink entries rather than silently omit them")
+	}
+}
+
+func TestBOMValidationRejectsDanglingDependencies(t *testing.T) {
+	bom := validTestBOM()
+	bom.Dependencies = []Dependency{{Ref: bom.Components[0].BOMRef, DependsOn: []string{"missing"}}}
+	if !hasBOMValidationErrors(bom) {
+		t.Fatal("dangling dependency must fail validation")
+	}
+}
+
+func TestTokenAndBindValidation(t *testing.T) {
+	if validServiceToken(strings.Repeat("a", 31)) || validServiceToken(strings.Repeat("a", 32)+"\x7f") {
+		t.Fatal("weak or control-bearing token accepted")
+	}
+	if !validServiceToken(strings.Repeat("a", 32)) {
+		t.Fatal("strong token rejected")
+	}
+	if !isLoopbackBind("127.0.0.1:8515") || isLoopbackBind("0.0.0.0:8515") {
+		t.Fatal("bind classification is incorrect")
+	}
+}
+
+func TestURLValidationRejectsUnsafeSchemes(t *testing.T) {
+	if isValidURL("file:///etc/passwd") || isValidURL("http://example.com/model") {
+		t.Fatal("unsafe URL scheme accepted")
+	}
+	if !isValidURL("https://example.com/model") || !isValidURL("http://127.0.0.1/model") {
+		t.Fatal("expected secure and loopback URLs to be accepted")
 	}
 }
 
@@ -959,7 +1416,10 @@ func TestIntegration_FullWorkflow(t *testing.T) {
 
 	// 5. Sign BOM
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
-	sb := SignBOM(bom, priv, "test")
+	sb, err := SignBOM(bom, priv, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
 	valid, reason := VerifySignedBOM(sb, pub)
 	if !valid {
 		t.Errorf("signed BOM should verify: %s", reason)
@@ -967,7 +1427,9 @@ func TestIntegration_FullWorkflow(t *testing.T) {
 
 	// 6. Create attestation
 	att := CreateAttestation(bom.Components[0].Name, "deployment-ready", "ci", evidence)
-	SignAttestation(&att, priv)
+	if err := SignAttestation(&att, priv); err != nil {
+		t.Fatal(err)
+	}
 	if !VerifyAttestation(att, pub) {
 		t.Error("attestation should verify")
 	}

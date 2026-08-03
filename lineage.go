@@ -7,14 +7,14 @@ import (
 
 // LineageEntry records one step in a model's derivation chain.
 type LineageEntry struct {
-	Step        int       `json:"step" yaml:"step"`
-	Action      string    `json:"action" yaml:"action"`           // download, quantize, fine-tune, merge, promote
-	Description string    `json:"description" yaml:"description"`
-	InputHash   string    `json:"input_hash,omitempty" yaml:"input_hash,omitempty"`
-	OutputHash  string    `json:"output_hash,omitempty" yaml:"output_hash,omitempty"`
-	Tool        string    `json:"tool,omitempty" yaml:"tool,omitempty"`
-	Timestamp   string    `json:"timestamp" yaml:"timestamp"`
-	Actor       string    `json:"actor,omitempty" yaml:"actor,omitempty"`
+	Step        int               `json:"step" yaml:"step"`
+	Action      string            `json:"action" yaml:"action"` // download, quantize, fine-tune, merge, promote
+	Description string            `json:"description" yaml:"description"`
+	InputHash   string            `json:"input_hash,omitempty" yaml:"input_hash,omitempty"`
+	OutputHash  string            `json:"output_hash,omitempty" yaml:"output_hash,omitempty"`
+	Tool        string            `json:"tool,omitempty" yaml:"tool,omitempty"`
+	Timestamp   string            `json:"timestamp" yaml:"timestamp"`
+	Actor       string            `json:"actor,omitempty" yaml:"actor,omitempty"`
 	Metadata    map[string]string `json:"metadata,omitempty" yaml:"metadata,omitempty"`
 }
 

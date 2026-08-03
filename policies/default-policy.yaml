@@ -1,5 +1,8 @@
 version: 1
 
+# Trust-bearing diff/evaluate inputs must be signed by VERIFY_KEY.
+require_signed_trust_inputs: true
+
 # Required fields for deployment readiness evaluation.
 # A model BOM must have all of these to pass the "evaluate" check.
 required_fields:
@@ -8,15 +11,17 @@ required_fields:
   - model_card
   - evidence
   - trust_labels
+  - promotion_status
 
 # Daemon settings.
 daemon:
   bind_addr: "127.0.0.1:8515"
   # Directories the /v1/generate endpoint is allowed to scan.
-  # Empty list permits all paths (backwards-compatible default).
+  # Empty list denies all daemon generation requests. Configure explicit roots.
   allowed_paths: []
   read_timeout_seconds: 30
   write_timeout_seconds: 60
+  requests_per_minute: 120
 
 # Privacy profile applied to evidence during export/redaction.
 # Set strip_* to true to redact the corresponding category.

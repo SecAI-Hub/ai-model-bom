@@ -1,0 +1,25 @@
+version: 1
+
+require_signed_trust_inputs: true
+
+required_fields:
+  - hash
+  - license
+  - model_card
+  - evidence
+  - trust_labels
+  - promotion_status
+
+daemon:
+  bind_addr: "0.0.0.0:8515"
+  allowed_paths:
+    - /models
+  read_timeout_seconds: 30
+  write_timeout_seconds: 60
+  requests_per_minute: 120
+
+privacy_profile:
+  strip_emails: true
+  strip_paths: true
+  strip_hostnames: true
+  strip_usernames: true
