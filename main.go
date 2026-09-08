@@ -278,6 +278,43 @@ func validateConfig(cfg *ServiceConfig) error {
 
 // ---------- CLI commands ----------
 
+// Go's flag parser stops at the first positional argument. Separate the one
+// model path from string-valued flags so the documented PATH [flags] form and
+// the [flags] PATH form both honor every option, with no silent leftovers.
+func parseGenerateFlags(fs *flag.FlagSet, args []string) error {
+	var flags, paths []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			paths = append(paths, args[i+1:]...)
+			break
+		}
+		if strings.HasPrefix(arg, "-") && arg != "-" {
+			flags = append(flags, arg)
+			name := strings.TrimLeft(strings.SplitN(arg, "=", 2)[0], "-")
+			if name == "h" || name == "help" {
+				return fs.Parse(args)
+			}
+			if fs.Lookup(name) == nil {
+				return fmt.Errorf("unknown generate flag %q", arg)
+			}
+			if !strings.Contains(arg, "=") {
+				i++
+				if i >= len(args) {
+					return fmt.Errorf("flag %q requires a value", arg)
+				}
+				flags = append(flags, args[i])
+			}
+		} else {
+			paths = append(paths, arg)
+		}
+	}
+	if len(paths) != 1 {
+		return fmt.Errorf("generate requires exactly one model path")
+	}
+	return fs.Parse(append(append(flags, "--"), paths...))
+}
+
 func cmdGenerate(args []string) {
 	fs := flag.NewFlagSet("generate", flag.ExitOnError)
 	metaFile := fs.String("meta", "", "Path to metadata YAML file")
@@ -289,9 +326,11 @@ func cmdGenerate(args []string) {
 		fmt.Fprintf(os.Stderr, "Usage: ai-model-bom generate PATH [flags]\n\nFlags:\n")
 		fs.PrintDefaults()
 	}
-	fs.Parse(args)
+	if err := parseGenerateFlags(fs, args); err != nil {
+		log.Fatal(err)
+	}
 
-	if fs.NArg() < 1 {
+	if fs.NArg() != 1 {
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -786,6 +825,9 @@ func buildMuxWithTokens(cfg *ServiceConfig, privKey ed25519.PrivateKey, verifyKe
 		}
 
 		metricGenerated.Add(1)
+		if cfg != nil && cfg.PrivacyProfile != nil {
+			bom = RedactBOM(bom, *cfg.PrivacyProfile)
+		}
 
 		resp := map[string]interface{}{"bom": bom}
 		if privKey != nil {
@@ -949,6 +991,9 @@ func buildMuxWithTokens(cfg *ServiceConfig, privKey ed25519.PrivateKey, verifyKe
 			}
 		}
 
+		if cfg != nil && cfg.PrivacyProfile != nil {
+			req.Evidence = RedactEvidence(req.Evidence, *cfg.PrivacyProfile)
+		}
 		att := CreateAttestation(req.Subject, req.Predicate, "ai-model-bom", req.Evidence)
 		if err := SignAttestation(&att, privKey); err != nil {
 			log.Printf("sign attestation: %v", err)

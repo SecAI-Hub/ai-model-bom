@@ -1,7 +1,10 @@
 package main
 
 import (
+	"fmt"
+	"net"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -25,7 +28,9 @@ func DefaultPrivacyProfile() PrivacyProfile {
 
 var (
 	reEmail    = regexp.MustCompile(`[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}`)
-	reAbsPath  = regexp.MustCompile(`(?:^|[\s"':=])(/(?:home|Users|var|tmp|etc|opt|usr|root)/[^\s"']+)`)
+	reAbsPath  = regexp.MustCompile(`(?:^|[\s"':=])(/[^/\s"'][^\s"']*)`)
+	reFileURI  = regexp.MustCompile(`(?i)\bfile://[^\s"'<>]+`)
+	reAddress  = regexp.MustCompile(`(?:[0-9]{1,3}\.){3}[0-9]{1,3}|[0-9a-fA-F]*:[0-9a-fA-F:.]+(?:%[A-Za-z0-9_.-]+)?`)
 	reWinPath  = regexp.MustCompile(`[A-Z]:\\[^\s"']+`)
 	reHostname = regexp.MustCompile(`(?i)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:local|internal|corp|lan|intra|priv)\b`)
 	reUsername = regexp.MustCompile(`(?i)(?:user(?:name)?|reviewer|actor|author|admin)\s*[:=]\s*["']?([^\s"',]+)["']?`)
@@ -45,7 +50,7 @@ func redactEvidenceItem(item EvidenceItem, profile PrivacyProfile) EvidenceItem 
 	// Copy the item
 	result := EvidenceItem{
 		Type:        item.Type,
-		Source:      item.Source,
+		Source:      redactString(item.Source, profile),
 		Timestamp:   item.Timestamp,
 		Result:      item.Result,
 		Description: redactString(item.Description, profile),
@@ -54,12 +59,26 @@ func redactEvidenceItem(item EvidenceItem, profile PrivacyProfile) EvidenceItem 
 
 	if item.Details != nil {
 		result.Details = make(map[string]string, len(item.Details))
-		for k, v := range item.Details {
+		keys := make([]string, 0, len(item.Details))
+		for k := range item.Details {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			v := item.Details[k]
+			key := redactString(k, profile)
+			base := key
+			for suffix := 2; ; suffix++ {
+				if _, exists := result.Details[key]; !exists {
+					break
+				}
+				key = fmt.Sprintf("%s#%d", base, suffix)
+			}
 			// Strip detail keys that are inherently sensitive
 			if profile.StripUsernames && isSensitiveKey(k) {
-				result.Details[k] = "[REDACTED]"
+				result.Details[key] = "[REDACTED]"
 			} else {
-				result.Details[k] = redactString(v, profile)
+				result.Details[key] = redactString(v, profile)
 			}
 		}
 	}
@@ -76,6 +95,7 @@ func redactString(s string, profile PrivacyProfile) string {
 		s = reEmail.ReplaceAllString(s, "[REDACTED:email]")
 	}
 	if profile.StripPaths {
+		s = reFileURI.ReplaceAllString(s, "[REDACTED:path]")
 		s = reAbsPath.ReplaceAllStringFunc(s, func(match string) string {
 			// Preserve the leading whitespace/delimiter
 			for i, c := range match {
@@ -89,6 +109,21 @@ func redactString(s string, profile PrivacyProfile) string {
 	}
 	if profile.StripHostnames {
 		s = reHostname.ReplaceAllString(s, "[REDACTED:hostname]")
+		s = reAddress.ReplaceAllStringFunc(s, func(candidate string) string {
+			// A preceding label can contribute hexadecimal letters to a match;
+			// try colon-delimited suffixes without accepting invalid addresses.
+			for value := candidate; value != ""; {
+				if net.ParseIP(strings.SplitN(value, "%", 2)[0]) != nil {
+					return "[REDACTED:address]"
+				}
+				i := strings.IndexByte(value, ':')
+				if i < 0 {
+					break
+				}
+				value = value[i+1:]
+			}
+			return candidate
+		})
 	}
 	if profile.StripUsernames {
 		s = reUsername.ReplaceAllStringFunc(s, func(match string) string {

@@ -15,7 +15,7 @@ Security-grade AI/ML Bill of Materials generator, verifier, and attestation comp
 
 ## Quick start
 
-Go 1.26.5 or newer is required.
+Go 1.26.8 or newer is required. CI and container builds use Go 1.27.1.
 
 ```bash
 # Build
